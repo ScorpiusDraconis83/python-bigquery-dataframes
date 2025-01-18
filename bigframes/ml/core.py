@@ -17,85 +17,24 @@
 from __future__ import annotations
 
 import datetime
-from typing import Callable, cast, Iterable, Literal, Mapping, Optional, Union
+from typing import Callable, cast, Iterable, Mapping, Optional, Union
 import uuid
 
 from google.cloud import bigquery
 
-import bigframes
 import bigframes.constants as constants
+import bigframes.formatting_helpers as formatting_helpers
 from bigframes.ml import sql as ml_sql
 import bigframes.pandas as bpd
+import bigframes.session
 
 
 class BaseBqml:
     """Base class for BQML functionalities."""
 
-    def __init__(self, session: bigframes.Session):
+    def __init__(self, session: bigframes.session.Session):
         self._session = session
         self._base_sql_generator = ml_sql.BaseSqlGenerator()
-
-    def _apply_sql(
-        self,
-        input_data: bpd.DataFrame,
-        func: Callable[[bpd.DataFrame], str],
-    ) -> bpd.DataFrame:
-        """Helper to wrap a dataframe in a SQL query, keeping the index intact.
-
-        Args:
-            session (bigframes.Session):
-                the active bigframes.Session
-
-            input_data (bigframes.dataframe.DataFrame):
-                the dataframe to be wrapped
-
-            func (function):
-                a function that will accept a SQL string and produce a new SQL
-                string from which to construct the output dataframe. It must
-                include the index columns of the input SQL.
-        """
-        _, index_col_ids, index_labels = input_data._to_sql_query(include_index=True)
-
-        sql = func(input_data)
-        df = self._session.read_gbq(sql, index_col=index_col_ids)
-        df.index.names = index_labels
-
-        return df
-
-    def distance(
-        self,
-        x: bpd.DataFrame,
-        y: bpd.DataFrame,
-        type: Literal["EUCLIDEAN", "MANHATTAN", "COSINE"],
-        name: str,
-    ) -> bpd.DataFrame:
-        """Calculate ML.DISTANCE from DataFrame inputs.
-
-        Args:
-            x:
-                input DataFrame
-            y:
-                input DataFrame
-            type:
-                Distance types, accept values are  "EUCLIDEAN", "MANHATTAN", "COSINE".
-            name:
-                name of the output result column
-        """
-        assert len(x.columns) == 1 and len(y.columns) == 1
-
-        input_data = x._cached().join(y._cached(), how="outer")
-        x_column_id, y_column_id = x._block.value_columns[0], y._block.value_columns[0]
-
-        return self._apply_sql(
-            input_data,
-            lambda source_df: self._base_sql_generator.ml_distance(
-                x_column_id,
-                y_column_id,
-                type=type,
-                source_df=source_df,
-                name=name,
-            ),
-        )
 
 
 class BqmlModel(BaseBqml):
@@ -108,9 +47,60 @@ class BqmlModel(BaseBqml):
     def __init__(self, session: bigframes.Session, model: bigquery.Model):
         self._session = session
         self._model = model
+        model_ref = self._model.reference
+        assert model_ref is not None
         self._model_manipulation_sql_generator = ml_sql.ModelManipulationSqlGenerator(
-            self.model_name
+            model_ref
         )
+
+    def _apply_ml_tvf(
+        self,
+        input_data: bpd.DataFrame,
+        apply_sql_tvf: Callable[[str], str],
+    ) -> bpd.DataFrame:
+        # Used for predict, transform, distance
+        """Helper to wrap a dataframe in a SQL query, keeping the index intact.
+
+        Args:
+            session (bigframes.Session):
+                the active bigframes.Session
+
+            input_data (bigframes.dataframe.DataFrame):
+                the dataframe to be wrapped
+
+            func (function):
+                Takes an input sql table value and applies a prediction tvf. The
+                resulting table value must include all input columns, with new
+                columns appended to the end.
+        """
+        # TODO: Preserve ordering information?
+        input_sql, index_col_ids, index_labels = input_data._to_sql_query(
+            include_index=True
+        )
+
+        result_sql = apply_sql_tvf(input_sql)
+        df = self._session.read_gbq(result_sql, index_col=index_col_ids)
+        if df._has_index:
+            df.index.names = index_labels
+        # Restore column labels
+        df.rename(
+            columns={
+                label: original_label
+                for label, original_label in zip(
+                    df.columns.values, input_data.columns.values
+                )
+            }
+        )
+        return df
+
+    def _keys(self):
+        return (self._session, self._model)
+
+    def __eq__(self, other):
+        return isinstance(other, self.__class__) and self._keys() == other._keys()
+
+    def __hash__(self):
+        return hash(self._keys())
 
     @property
     def session(self) -> bigframes.Session:
@@ -128,15 +118,24 @@ class BqmlModel(BaseBqml):
         return self._model
 
     def predict(self, input_data: bpd.DataFrame) -> bpd.DataFrame:
-        # TODO: validate input data schema
-        return self._apply_sql(
+        return self._apply_ml_tvf(
             input_data,
             self._model_manipulation_sql_generator.ml_predict,
         )
 
+    def explain_predict(
+        self, input_data: bpd.DataFrame, options: Mapping[str, int | float]
+    ) -> bpd.DataFrame:
+        return self._apply_ml_tvf(
+            input_data,
+            lambda source_sql: self._model_manipulation_sql_generator.ml_explain_predict(
+                source_sql=source_sql,
+                struct_options=options,
+            ),
+        )
+
     def transform(self, input_data: bpd.DataFrame) -> bpd.DataFrame:
-        # TODO: validate input data schema
-        return self._apply_sql(
+        return self._apply_ml_tvf(
             input_data,
             self._model_manipulation_sql_generator.ml_transform,
         )
@@ -146,25 +145,36 @@ class BqmlModel(BaseBqml):
         input_data: bpd.DataFrame,
         options: Mapping[str, int | float],
     ) -> bpd.DataFrame:
-        # TODO: validate input data schema
-        return self._apply_sql(
+        return self._apply_ml_tvf(
             input_data,
-            lambda source_df: self._model_manipulation_sql_generator.ml_generate_text(
-                source_df=source_df,
+            lambda source_sql: self._model_manipulation_sql_generator.ml_generate_text(
+                source_sql=source_sql,
                 struct_options=options,
             ),
         )
 
-    def generate_text_embedding(
+    def generate_embedding(
         self,
         input_data: bpd.DataFrame,
         options: Mapping[str, int | float],
     ) -> bpd.DataFrame:
-        # TODO: validate input data schema
-        return self._apply_sql(
+        return self._apply_ml_tvf(
             input_data,
-            lambda source_df: self._model_manipulation_sql_generator.ml_generate_text_embedding(
-                source_df=source_df,
+            lambda source_sql: self._model_manipulation_sql_generator.ml_generate_embedding(
+                source_sql=source_sql,
+                struct_options=options,
+            ),
+        )
+
+    def detect_anomalies(
+        self, input_data: bpd.DataFrame, options: Mapping[str, int | float]
+    ) -> bpd.DataFrame:
+        assert self._model.model_type in ("PCA", "KMEANS", "ARIMA_PLUS")
+
+        return self._apply_ml_tvf(
+            input_data,
+            lambda source_sql: self._model_manipulation_sql_generator.ml_detect_anomalies(
+                source_sql=source_sql,
                 struct_options=options,
             ),
         )
@@ -173,9 +183,29 @@ class BqmlModel(BaseBqml):
         sql = self._model_manipulation_sql_generator.ml_forecast(struct_options=options)
         return self._session.read_gbq(sql, index_col="forecast_timestamp").reset_index()
 
+    def explain_forecast(self, options: Mapping[str, int | float]) -> bpd.DataFrame:
+        sql = self._model_manipulation_sql_generator.ml_explain_forecast(
+            struct_options=options
+        )
+        return self._session.read_gbq(
+            sql, index_col="time_series_timestamp"
+        ).reset_index()
+
     def evaluate(self, input_data: Optional[bpd.DataFrame] = None):
-        # TODO: validate input data schema
-        sql = self._model_manipulation_sql_generator.ml_evaluate(input_data)
+        sql = self._model_manipulation_sql_generator.ml_evaluate(
+            input_data.sql if (input_data is not None) else None
+        )
+
+        return self._session.read_gbq(sql)
+
+    def llm_evaluate(
+        self,
+        input_data: bpd.DataFrame,
+        task_type: Optional[str] = None,
+    ):
+        sql = self._model_manipulation_sql_generator.ml_llm_evaluate(
+            input_data.sql, task_type
+        )
 
         return self._session.read_gbq(sql)
 
@@ -183,6 +213,11 @@ class BqmlModel(BaseBqml):
         sql = self._model_manipulation_sql_generator.ml_arima_evaluate(
             show_all_candidate_models
         )
+
+        return self._session.read_gbq(sql)
+
+    def arima_coefficients(self) -> bpd.DataFrame:
+        sql = self._model_manipulation_sql_generator.ml_arima_coefficients()
 
         return self._session.read_gbq(sql)
 
@@ -212,14 +247,15 @@ class BqmlModel(BaseBqml):
         return self._session.read_gbq(sql)
 
     def copy(self, new_model_name: str, replace: bool = False) -> BqmlModel:
-        job_config = bigquery.job.CopyJobConfig()
+        job_config = self._session._prepare_copy_job_config()
+
         if replace:
             job_config.write_disposition = "WRITE_TRUNCATE"
 
         copy_job = self._session.bqclient.copy_table(
             self.model_name, new_model_name, job_config=job_config
         )
-        self._session._start_generic_job(copy_job)
+        _start_generic_job(copy_job)
 
         new_model = self._session.bqclient.get_model(new_model_name)
         return BqmlModel(self._session, new_model)
@@ -236,7 +272,7 @@ class BqmlModel(BaseBqml):
             options={"vertex_ai_model_id": vertex_ai_model_id}
         )
         # Register the model and wait it to finish
-        self._session._start_query(sql)
+        self._session._start_query_ml_ddl(sql)
 
         self._model = self._session.bqclient.get_model(self.model_name)
         return self
@@ -255,7 +291,7 @@ class BqmlModelFactory:
 
     def _create_model_with_sql(self, session: bigframes.Session, sql: str) -> BqmlModel:
         # fit the model, synchronously
-        _, job = session._start_query(sql)
+        _, job = session._start_query_ml_ddl(sql)
 
         # real model path in the session specific hidden dataset and table prefix
         model_name_full = f"{job.destination.project}.{job.destination.dataset_id}.{job.destination.table_id}"
@@ -290,21 +326,62 @@ class BqmlModelFactory:
         # Cache dataframes to make sure base table is not a snapshot
         # cached dataframe creates a full copy, never uses snapshot
         if y_train is None:
-            input_data = X_train._cached(force=True)
+            input_data = X_train.reset_index(drop=True).cache()
         else:
-            input_data = X_train._cached(force=True).join(
-                y_train._cached(force=True), how="outer"
+            input_data = (
+                X_train.join(y_train, how="outer").reset_index(drop=True).cache()
             )
             options.update({"INPUT_LABEL_COLS": y_train.columns.tolist()})
 
         session = X_train._session
+        if session._bq_kms_key_name:
+            options.update({"kms_key_name": session._bq_kms_key_name})
+
         model_ref = self._create_model_ref(session._anonymous_dataset)
 
         sql = self._model_creation_sql_generator.create_model(
-            source_df=input_data,
+            source_sql=input_data.sql,
             model_ref=model_ref,
             transforms=transforms,
             options=options,
+        )
+
+        return self._create_model_with_sql(session=session, sql=sql)
+
+    def create_llm_remote_model(
+        self,
+        X_train: bpd.DataFrame,
+        y_train: bpd.DataFrame,
+        connection_name: str,
+        options: Mapping[str, Union[str, int, float, Iterable[str]]] = {},
+    ) -> BqmlModel:
+        """Create a session-temporary BQML model with the CREATE OR REPLACE MODEL statement
+
+        Args:
+            X_train: features columns for training
+            y_train: labels columns for training
+            options: a dict of options to configure the model. Generates a BQML OPTIONS
+                clause
+            connection_name:
+                a BQ connection to talk with Vertex AI, of the format <PROJECT_NUMBER>.<REGION>.<CONNECTION_NAME>. https://cloud.google.com/bigquery/docs/create-cloud-resource-connection
+
+        Returns: a BqmlModel, wrapping a trained model in BigQuery
+        """
+        options = dict(options)
+        # Cache dataframes to make sure base table is not a snapshot
+        # cached dataframe creates a full copy, never uses snapshot
+        input_data = X_train.join(y_train, how="outer").cache()
+        options.update({"INPUT_LABEL_COLS": y_train.columns.tolist()})
+
+        session = X_train._session
+
+        model_ref = self._create_model_ref(session._anonymous_dataset)
+
+        sql = self._model_creation_sql_generator.create_llm_remote_model(
+            source_sql=input_data.sql,
+            model_ref=model_ref,
+            options=options,
+            connection_name=connection_name,
         )
 
         return self._create_model_with_sql(session=session, sql=sql)
@@ -326,9 +403,7 @@ class BqmlModelFactory:
         options = dict(options)
         # Cache dataframes to make sure base table is not a snapshot
         # cached dataframe creates a full copy, never uses snapshot
-        input_data = X_train._cached(force=True).join(
-            y_train._cached(force=True), how="outer"
-        )
+        input_data = X_train.join(y_train, how="outer").cache()
         options.update({"TIME_SERIES_TIMESTAMP_COL": X_train.columns.tolist()[0]})
         options.update({"TIME_SERIES_DATA_COL": y_train.columns.tolist()[0]})
 
@@ -336,7 +411,7 @@ class BqmlModelFactory:
         model_ref = self._create_model_ref(session._anonymous_dataset)
 
         sql = self._model_creation_sql_generator.create_model(
-            source_df=input_data,
+            source_sql=input_data.sql,
             model_ref=model_ref,
             transforms=transforms,
             options=options,
@@ -428,3 +503,12 @@ class BqmlModelFactory:
         )
 
         return self._create_model_with_sql(session=session, sql=sql)
+
+
+def _start_generic_job(job: formatting_helpers.GenericJob):
+    if bigframes.options.display.progress_bar is not None:
+        formatting_helpers.wait_for_job(
+            job, bigframes.options.display.progress_bar
+        )  # Wait for the job to complete
+    else:
+        job.result()

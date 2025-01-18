@@ -17,13 +17,16 @@ from __future__ import annotations
 import re
 from typing import cast, Literal, Optional, Union
 
-import bigframes.constants as constants
+import bigframes_vendored.constants as constants
+import bigframes_vendored.pandas.core.strings.accessor as vendorstr
+
+from bigframes import clients
 from bigframes.core import log_adapter
 import bigframes.dataframe as df
 import bigframes.operations as ops
+from bigframes.operations._op_converters import convert_index, convert_slice
 import bigframes.operations.base
 import bigframes.series as series
-import third_party.bigframes_vendored.pandas.core.strings.accessor as vendorstr
 
 # Maps from python to re2
 REGEXP_FLAGS = {
@@ -36,6 +39,14 @@ REGEXP_FLAGS = {
 @log_adapter.class_logger
 class StringMethods(bigframes.operations.base.SeriesMethods, vendorstr.StringMethods):
     __doc__ = vendorstr.StringMethods.__doc__
+
+    def __getitem__(self, key: Union[int, slice]) -> series.Series:
+        if isinstance(key, int):
+            return self._apply_unary_op(convert_index(key))
+        elif isinstance(key, slice):
+            return self._apply_unary_op(convert_slice(key))
+        else:
+            raise ValueError(f"key must be an int or slice, got {type(key).__name__}")
 
     def find(
         self,
@@ -52,7 +63,25 @@ class StringMethods(bigframes.operations.base.SeriesMethods, vendorstr.StringMet
         return self._apply_unary_op(ops.lower_op)
 
     def reverse(self) -> series.Series:
-        """Reverse strings in the Series."""
+        """Reverse strings in the Series.
+
+        **Examples:**
+
+            >>> import bigframes.pandas as bpd
+            >>> bpd.options.display.progress_bar = None
+
+            >>> s = bpd.Series(["apple", "banana", "", bpd.NA])
+            >>> s.str.reverse()
+            0     elppa
+            1    ananab
+            2
+            3      <NA>
+            dtype: string
+
+        Returns:
+            bigframes.series.Series: A Series of booleans indicating whether the given
+                pattern matches the start of each string element.
+        """
         # reverse method is in ibis, not pandas.
         return self._apply_unary_op(ops.reverse_op)
 
@@ -228,6 +257,18 @@ class StringMethods(bigframes.operations.base.SeriesMethods, vendorstr.StringMet
             pat = (pat,)
         return self._apply_unary_op(ops.EndsWithOp(pat=pat))
 
+    def split(
+        self,
+        pat: str = " ",
+        regex: Union[bool, None] = None,
+    ) -> series.Series:
+        if regex is True or (regex is None and len(pat) > 1):
+            raise NotImplementedError(
+                "Regular expressions aren't currently supported. Please set "
+                + f"`regex=False` and try again. {constants.FEEDBACK_LINK}"
+            )
+        return self._apply_unary_op(ops.StringSplitOp(pat=pat))
+
     def zfill(self, width: int) -> series.Series:
         return self._apply_unary_op(ops.ZfillOp(width=width))
 
@@ -243,6 +284,35 @@ class StringMethods(bigframes.operations.base.SeriesMethods, vendorstr.StringMet
         join: Literal["outer", "left"] = "left",
     ) -> series.Series:
         return self._apply_binary_op(others, ops.strconcat_op, alignment=join)
+
+    def to_blob(self, connection: Optional[str] = None) -> series.Series:
+        """Create a BigFrames Blob series from a series of URIs.
+
+        .. note::
+            BigFrames Blob is still under experiments. It may not work and subject to change in the future.
+
+
+        Args:
+            connection (str or None, default None):
+                Connection to connect with remote service. str of the format <PROJECT_NUMBER/PROJECT_ID>.<LOCATION>.<CONNECTION_ID>.
+                If None, use default connection in session context. BigQuery DataFrame will try to create the connection and attach
+                permission if the connection isn't fully set up.
+
+        Returns:
+            bigframes.series.Series: Blob Series.
+
+        """
+        if not bigframes.options.experiments.blob:
+            raise NotImplementedError()
+
+        session = self._block.session
+        connection = connection or session._bq_connection
+        connection = clients.resolve_full_bq_connection_name(
+            connection,
+            default_project=session._project,
+            default_location=session._location,
+        )
+        return self._apply_binary_op(connection, ops.obj_make_ref_op)
 
 
 def _parse_flags(flags: int) -> Optional[str]:

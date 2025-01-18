@@ -14,26 +14,34 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import datetime
+import functools
 import io
 import typing
-from typing import Iterable, Sequence
+from typing import Iterable, List, Optional, Sequence, Tuple
+import warnings
 
-import ibis.expr.types as ibis_types
+import google.cloud.bigquery
 import pandas
+import pyarrow as pa
+import pyarrow.feather as pa_feather
 
-import bigframes.core.compile as compiling
 import bigframes.core.expression as ex
 import bigframes.core.guid
+import bigframes.core.identifiers as ids
 import bigframes.core.join_def as join_def
+import bigframes.core.local_data as local_data
 import bigframes.core.nodes as nodes
-from bigframes.core.ordering import OrderingColumnReference
+from bigframes.core.ordering import OrderingExpression
 import bigframes.core.ordering as orderings
+import bigframes.core.schema as schemata
+import bigframes.core.tree_properties
 import bigframes.core.utils
 from bigframes.core.window_spec import WindowSpec
 import bigframes.dtypes
+import bigframes.exceptions as bfe
 import bigframes.operations as ops
 import bigframes.operations.aggregations as agg_ops
-import bigframes.session._io.bigquery
 
 if typing.TYPE_CHECKING:
     from bigframes.session import Session
@@ -51,39 +59,90 @@ class ArrayValue:
     node: nodes.BigFrameNode
 
     @classmethod
-    def from_ibis(
-        cls,
-        session: Session,
-        table: ibis_types.Table,
-        columns: Sequence[ibis_types.Value],
-        hidden_ordering_columns: Sequence[ibis_types.Value],
-        ordering: orderings.ExpressionOrdering,
-    ):
-        node = nodes.ReadGbqNode(
-            table=table,
-            table_session=session,
-            columns=tuple(columns),
-            hidden_ordering_columns=tuple(hidden_ordering_columns),
-            ordering=ordering,
+    def from_pyarrow(cls, arrow_table: pa.Table, session: Session):
+        adapted_table = local_data.adapt_pa_table(arrow_table)
+        schema = local_data.arrow_schema_to_bigframes(adapted_table.schema)
+
+        iobytes = io.BytesIO()
+        pa_feather.write_feather(adapted_table, iobytes)
+        # Scan all columns by default, we define this list as it can be pruned while preserving source_def
+        scan_list = nodes.ScanList(
+            tuple(
+                nodes.ScanItem(ids.ColumnId(item.column), item.dtype, item.column)
+                for item in schema.items
+            )
+        )
+
+        node = nodes.ReadLocalNode(
+            iobytes.getvalue(),
+            data_schema=schema,
+            session=session,
+            n_rows=arrow_table.num_rows,
+            scan_list=scan_list,
         )
         return cls(node)
 
     @classmethod
-    def from_pandas(cls, pd_df: pandas.DataFrame):
-        iobytes = io.BytesIO()
-        # Use alphanumeric identifiers, to avoid downstream problems with escaping.
-        as_ids = [
-            bigframes.core.utils.label_to_identifier(label, strict=True)
-            for label in pd_df.columns
-        ]
-        unique_ids = tuple(bigframes.core.utils.disambiguate_ids(as_ids))
-        pd_df.reset_index(drop=True).set_axis(unique_ids, axis=1).to_feather(iobytes)
-        node = nodes.ReadLocalNode(iobytes.getvalue())
+    def from_range(cls, start, end, step):
+        return cls(
+            nodes.FromRangeNode(
+                start=start.node,
+                end=end.node,
+                step=step,
+            )
+        )
+
+    @classmethod
+    def from_table(
+        cls,
+        table: google.cloud.bigquery.Table,
+        schema: schemata.ArraySchema,
+        session: Session,
+        *,
+        predicate: Optional[str] = None,
+        at_time: Optional[datetime.datetime] = None,
+        primary_key: Sequence[str] = (),
+        offsets_col: Optional[str] = None,
+    ):
+        if offsets_col and primary_key:
+            raise ValueError("must set at most one of 'offests', 'primary_key'")
+        if any(i.field_type == "JSON" for i in table.schema if i.name in schema.names):
+            msg = (
+                "Interpreting JSON column(s) as pyarrow.large_string. "
+                "This behavior may change in future versions."
+            )
+            warnings.warn(msg, bfe.PreviewWarning)
+        # define data source only for needed columns, this makes row-hashing cheaper
+        table_def = nodes.GbqTable.from_table(table, columns=schema.names)
+
+        # create ordering from info
+        ordering = None
+        if offsets_col:
+            ordering = orderings.TotalOrdering.from_offset_col(offsets_col)
+        elif primary_key:
+            ordering = orderings.TotalOrdering.from_primary_key(primary_key)
+
+        # Scan all columns by default, we define this list as it can be pruned while preserving source_def
+        scan_list = nodes.ScanList(
+            tuple(
+                nodes.ScanItem(ids.ColumnId(item.column), item.dtype, item.column)
+                for item in schema.items
+            )
+        )
+        source_def = nodes.BigqueryDataSource(
+            table=table_def, at_time=at_time, sql_predicate=predicate, ordering=ordering
+        )
+        node = nodes.ReadTableNode(
+            source=source_def,
+            scan_list=scan_list,
+            table_session=session,
+        )
         return cls(node)
 
     @property
     def column_ids(self) -> typing.Sequence[str]:
-        return self._compile_ordered().column_ids
+        """Returns column ids as strings."""
+        return self.schema.names
 
     @property
     def session(self) -> Session:
@@ -94,22 +153,57 @@ class ArrayValue:
             required_session if (required_session is not None) else get_global_session()
         )
 
+    @functools.cached_property
+    def schema(self) -> schemata.ArraySchema:
+        return self.node.schema
+
+    @property
+    def explicitly_ordered(self) -> bool:
+        # see BigFrameNode.explicitly_ordered
+        return self.node.explicitly_ordered
+
+    @property
+    def order_ambiguous(self) -> bool:
+        # see BigFrameNode.order_ambiguous
+        return self.node.order_ambiguous
+
+    @property
+    def supports_fast_peek(self) -> bool:
+        return bigframes.core.tree_properties.can_fast_peek(self.node)
+
+    def as_cached(
+        self: ArrayValue,
+        cache_table: google.cloud.bigquery.Table,
+        ordering: Optional[orderings.RowOrdering],
+    ) -> ArrayValue:
+        """
+        Replace the node with an equivalent one that references a table where the value has been materialized to.
+        """
+        table = nodes.GbqTable.from_table(cache_table)
+        source = nodes.BigqueryDataSource(table, ordering=ordering)
+        # Assumption: GBQ cached table uses field name as bq column name
+        scan_list = nodes.ScanList(
+            tuple(
+                nodes.ScanItem(field.id, field.dtype, field.id.name)
+                for field in self.node.fields
+            )
+        )
+        node = nodes.CachedTableNode(
+            original_node=self.node,
+            source=source,
+            table_session=self.session,
+            scan_list=scan_list,
+        )
+        return ArrayValue(node)
+
     def _try_evaluate_local(self):
         """Use only for unit testing paths - not fully featured. Will throw exception if fails."""
-        import ibis
+        import bigframes.core.compile
 
-        return ibis.pandas.connect({}).execute(
-            self._compile_ordered()._to_ibis_expr(ordering_mode="unordered")
-        )
+        return bigframes.core.compile.test_only_try_evaluate(self.node)
 
     def get_column_type(self, key: str) -> bigframes.dtypes.Dtype:
-        return self._compile_ordered().get_column_type(key)
-
-    def _compile_ordered(self) -> compiling.OrderedIR:
-        return compiling.compile_ordered_ir(self.node)
-
-    def _compile_unordered(self) -> compiling.UnorderedIR:
-        return compiling.compile_unordered_ir(self.node)
+        return self.schema.get_type(key)
 
     def row_count(self) -> ArrayValue:
         """Get number of rows in ArrayValue as a single-entry ArrayValue."""
@@ -118,7 +212,7 @@ class ArrayValue:
     # Operations
     def filter_by_id(self, predicate_id: str, keep_null: bool = False) -> ArrayValue:
         """Filter the table on a given expression, the predicate must be a boolean series aligned with the table expression."""
-        predicate: ex.Expression = ex.free_var(predicate_id)
+        predicate: ex.Expression = ex.deref(predicate_id)
         if keep_null:
             predicate = ops.fillna_op.as_expr(predicate, ex.const(True))
         return self.filter(predicate)
@@ -126,117 +220,132 @@ class ArrayValue:
     def filter(self, predicate: ex.Expression):
         return ArrayValue(nodes.FilterNode(child=self.node, predicate=predicate))
 
-    def order_by(self, by: Sequence[OrderingColumnReference]) -> ArrayValue:
-        return ArrayValue(nodes.OrderByNode(child=self.node, by=tuple(by)))
+    def order_by(
+        self, by: Sequence[OrderingExpression], is_total_order: bool = False
+    ) -> ArrayValue:
+        return ArrayValue(
+            nodes.OrderByNode(
+                child=self.node, by=tuple(by), is_total_order=is_total_order
+            )
+        )
 
     def reversed(self) -> ArrayValue:
         return ArrayValue(nodes.ReversedNode(child=self.node))
 
-    def promote_offsets(self, col_id: str) -> ArrayValue:
+    def slice(
+        self, start: Optional[int], stop: Optional[int], step: Optional[int]
+    ) -> ArrayValue:
+        if self.node.order_ambiguous and not (self.session._strictly_ordered):
+            msg = "Window ordering may be ambiguous, this can cause unstable results."
+            warnings.warn(msg, bfe.AmbiguousWindowWarning)
+        return ArrayValue(
+            nodes.SliceNode(
+                self.node,
+                start=start,
+                stop=stop,
+                step=step if (step is not None) else 1,
+            )
+        )
+
+    def promote_offsets(self) -> Tuple[ArrayValue, str]:
         """
         Convenience function to promote copy of column offsets to a value column. Can be used to reset index.
         """
-        return ArrayValue(nodes.PromoteOffsetsNode(child=self.node, col_id=col_id))
+        col_id = self._gen_namespaced_uid()
+        if self.node.order_ambiguous and not (self.session._strictly_ordered):
+            if not self.session._allows_ambiguity:
+                raise ValueError(
+                    "Generating offsets not supported in partial ordering mode"
+                )
+            else:
+                msg = (
+                    "Window ordering may be ambiguous, this can cause unstable results."
+                )
+                warnings.warn(msg, category=bfe.AmbiguousWindowWarning)
+
+        return (
+            ArrayValue(
+                nodes.PromoteOffsetsNode(child=self.node, col_id=ids.ColumnId(col_id))
+            ),
+            col_id,
+        )
 
     def concat(self, other: typing.Sequence[ArrayValue]) -> ArrayValue:
         """Append together multiple ArrayValue objects."""
         return ArrayValue(
-            nodes.ConcatNode(children=tuple([self.node, *[val.node for val in other]]))
+            nodes.ConcatNode(
+                children=tuple([self.node, *[val.node for val in other]]),
+                output_ids=tuple(
+                    ids.ColumnId(bigframes.core.guid.generate_guid())
+                    for id in self.column_ids
+                ),
+            )
         )
 
-    def project_to_id(self, expression: ex.Expression, output_id: str):
-        if output_id in self.column_ids:  # Mutate case
-            exprs = [
-                ((expression if (col_id == output_id) else ex.free_var(col_id)), col_id)
-                for col_id in self.column_ids
-            ]
-        else:  # append case
-            self_projection = (
-                (ex.free_var(col_id), col_id) for col_id in self.column_ids
-            )
-            exprs = [*self_projection, (expression, output_id)]
-        return ArrayValue(
-            nodes.ProjectionNode(
-                child=self.node,
-                assignments=tuple(exprs),
-            )
+    def compute_values(self, assignments: Sequence[ex.Expression]):
+        col_ids = self._gen_namespaced_uids(len(assignments))
+        ex_id_pairs = tuple(
+            (ex, ids.ColumnId(id)) for ex, id in zip(assignments, col_ids)
         )
+        return (
+            ArrayValue(nodes.ProjectionNode(child=self.node, assignments=ex_id_pairs)),
+            col_ids,
+        )
+
+    def project_to_id(self, expression: ex.Expression):
+        array_val, ids = self.compute_values(
+            [expression],
+        )
+        return array_val, ids[0]
 
     def assign(self, source_id: str, destination_id: str) -> ArrayValue:
         if destination_id in self.column_ids:  # Mutate case
             exprs = [
                 (
-                    (
-                        ex.free_var(source_id)
-                        if (col_id == destination_id)
-                        else ex.free_var(col_id)
-                    ),
-                    col_id,
+                    ex.deref(source_id if (col_id == destination_id) else col_id),
+                    ids.ColumnId(col_id),
                 )
                 for col_id in self.column_ids
             ]
         else:  # append case
             self_projection = (
-                (ex.free_var(col_id), col_id) for col_id in self.column_ids
+                (ex.deref(col_id), ids.ColumnId(col_id)) for col_id in self.column_ids
             )
-            exprs = [*self_projection, (ex.free_var(source_id), destination_id)]
+            exprs = [
+                *self_projection,
+                (ex.deref(source_id), ids.ColumnId(destination_id)),
+            ]
         return ArrayValue(
-            nodes.ProjectionNode(
+            nodes.SelectionNode(
                 child=self.node,
-                assignments=tuple(exprs),
+                input_output_pairs=tuple(exprs),
             )
         )
 
-    def assign_constant(
+    def create_constant(
         self,
-        destination_id: str,
         value: typing.Any,
         dtype: typing.Optional[bigframes.dtypes.Dtype],
-    ) -> ArrayValue:
-        if destination_id in self.column_ids:  # Mutate case
-            exprs = [
-                (
-                    (
-                        ex.const(value, dtype)
-                        if (col_id == destination_id)
-                        else ex.free_var(col_id)
-                    ),
-                    col_id,
-                )
-                for col_id in self.column_ids
-            ]
-        else:  # append case
-            self_projection = (
-                (ex.free_var(col_id), col_id) for col_id in self.column_ids
-            )
-            exprs = [*self_projection, (ex.const(value, dtype), destination_id)]
-        return ArrayValue(
-            nodes.ProjectionNode(
-                child=self.node,
-                assignments=tuple(exprs),
-            )
-        )
+    ) -> Tuple[ArrayValue, str]:
+        if pandas.isna(value):
+            # Need to assign a data type when value is NaN.
+            dtype = dtype or bigframes.dtypes.DEFAULT_DTYPE
+
+        return self.project_to_id(ex.const(value, dtype))
 
     def select_columns(self, column_ids: typing.Sequence[str]) -> ArrayValue:
-        selections = ((ex.free_var(col_id), col_id) for col_id in column_ids)
+        # This basically just drops and reorders columns - logically a no-op except as a final step
+        selections = ((ex.deref(col_id), ids.ColumnId(col_id)) for col_id in column_ids)
         return ArrayValue(
-            nodes.ProjectionNode(
+            nodes.SelectionNode(
                 child=self.node,
-                assignments=tuple(selections),
+                input_output_pairs=tuple(selections),
             )
         )
 
     def drop_columns(self, columns: Iterable[str]) -> ArrayValue:
-        new_projection = (
-            (ex.free_var(col_id), col_id)
-            for col_id in self.column_ids
-            if col_id not in columns
-        )
-        return ArrayValue(
-            nodes.ProjectionNode(
-                child=self.node,
-                assignments=tuple(new_projection),
-            )
+        return self.select_columns(
+            [col_id for col_id in self.column_ids if col_id not in columns]
         )
 
     def aggregate(
@@ -252,11 +361,12 @@ class ArrayValue:
             by_column_id: column id of the aggregation key, this is preserved through the transform
             dropna: whether null keys should be dropped
         """
+        agg_defs = tuple((agg, ids.ColumnId(name)) for agg, name in aggregations)
         return ArrayValue(
             nodes.AggregateNode(
                 child=self.node,
-                aggregations=tuple(aggregations),
-                by_column_ids=tuple(by_column_ids),
+                aggregations=agg_defs,
+                by_column_ids=tuple(map(ex.deref, by_column_ids)),
                 dropna=dropna,
             )
         )
@@ -266,11 +376,10 @@ class ArrayValue:
         column_name: str,
         op: agg_ops.UnaryWindowOp,
         window_spec: WindowSpec,
-        output_name=None,
         *,
         never_skip_nulls=False,
         skip_reproject_unsafe: bool = False,
-    ) -> ArrayValue:
+    ) -> Tuple[ArrayValue, str]:
         """
         Creates a new expression based on this expression with unary operation applied to one column.
         column_name: the id of the input column present in the expression
@@ -280,85 +389,124 @@ class ArrayValue:
         never_skip_nulls: will disable null skipping for operators that would otherwise do so
         skip_reproject_unsafe: skips the reprojection step, can be used when performing many non-dependent window operations, user responsible for not nesting window expressions, or using outputs as join, filter or aggregation keys before a reprojection
         """
-        return ArrayValue(
-            nodes.WindowOpNode(
-                child=self.node,
-                column_name=column_name,
-                op=op,
-                window_spec=window_spec,
-                output_name=output_name,
-                never_skip_nulls=never_skip_nulls,
-                skip_reproject_unsafe=skip_reproject_unsafe,
-            )
+        # TODO: Support non-deterministic windowing
+        if window_spec.row_bounded or not op.order_independent:
+            if self.node.order_ambiguous and not self.session._strictly_ordered:
+                if not self.session._allows_ambiguity:
+                    raise ValueError(
+                        "Generating offsets not supported in partial ordering mode"
+                    )
+                else:
+                    msg = "Window ordering may be ambiguous, this can cause unstable results."
+                    warnings.warn(msg, category=bfe.AmbiguousWindowWarning)
+
+        output_name = self._gen_namespaced_uid()
+        return (
+            ArrayValue(
+                nodes.WindowOpNode(
+                    child=self.node,
+                    column_name=ex.deref(column_name),
+                    op=op,
+                    window_spec=window_spec,
+                    output_name=ids.ColumnId(output_name),
+                    never_skip_nulls=never_skip_nulls,
+                    skip_reproject_unsafe=skip_reproject_unsafe,
+                )
+            ),
+            output_name,
         )
 
-    def _reproject_to_table(self) -> ArrayValue:
-        """
-        Internal operators that projects the internal representation into a
-        new ibis table expression where each value column is a direct
-        reference to a column in that table expression. Needed after
-        some operations such as window operations that cannot be used
-        recursively in projections.
-        """
-        return ArrayValue(
-            nodes.ReprojectOpNode(
-                child=self.node,
-            )
-        )
-
-    def unpivot(
-        self,
-        row_labels: typing.Sequence[typing.Hashable],
-        unpivot_columns: typing.Sequence[
-            typing.Tuple[str, typing.Tuple[typing.Optional[str], ...]]
-        ],
-        *,
-        passthrough_columns: typing.Sequence[str] = (),
-        index_col_ids: typing.Sequence[str] = ["index"],
-        dtype: typing.Union[
-            bigframes.dtypes.Dtype, typing.Tuple[bigframes.dtypes.Dtype, ...]
-        ] = pandas.Float64Dtype(),
-        how: typing.Literal["left", "right"] = "left",
-    ) -> ArrayValue:
-        """
-        Unpivot ArrayValue columns.
-
-        Args:
-            row_labels: Identifies the source of the row. Must be equal to length to source column list in unpivot_columns argument.
-            unpivot_columns: Mapping of column id to list of input column ids. Lists of input columns may use None.
-            passthrough_columns: Columns that will not be unpivoted. Column id will be preserved.
-            index_col_id (str): The column id to be used for the row labels.
-            dtype (dtype or list of dtype): Dtype to use for the unpivot columns. If list, must be equal in number to unpivot_columns.
-
-        Returns:
-            ArrayValue: The unpivoted ArrayValue
-        """
-        return ArrayValue(
-            nodes.UnpivotNode(
-                child=self.node,
-                row_labels=tuple(row_labels),
-                unpivot_columns=tuple(unpivot_columns),
-                passthrough_columns=tuple(passthrough_columns),
-                index_col_ids=tuple(index_col_ids),
-                dtype=dtype,
-                how=how,
-            )
-        )
-
-    def join(
+    def relational_join(
         self,
         other: ArrayValue,
-        join_def: join_def.JoinDefinition,
-        allow_row_identity_join: bool = True,
-    ):
-        return ArrayValue(
-            nodes.JoinNode(
-                left_child=self.node,
-                right_child=other.node,
-                join=join_def,
-                allow_row_identity_join=allow_row_identity_join,
-            )
+        conditions: typing.Tuple[typing.Tuple[str, str], ...] = (),
+        type: typing.Literal["inner", "outer", "left", "right", "cross"] = "inner",
+    ) -> typing.Tuple[ArrayValue, typing.Tuple[dict[str, str], dict[str, str]]]:
+        l_mapping = {  # Identity mapping, only rename right side
+            lcol.name: lcol.name for lcol in self.node.ids
+        }
+        other_node, r_mapping = self.prepare_join_names(other)
+        join_node = nodes.JoinNode(
+            left_child=self.node,
+            right_child=other_node,
+            conditions=tuple(
+                (ex.deref(l_mapping[l_col]), ex.deref(r_mapping[r_col]))
+                for l_col, r_col in conditions
+            ),
+            type=type,
         )
+        return ArrayValue(join_node), (l_mapping, r_mapping)
+
+    def try_row_join(
+        self,
+        other: ArrayValue,
+        conditions: typing.Tuple[typing.Tuple[str, str], ...] = (),
+    ) -> Optional[
+        typing.Tuple[ArrayValue, typing.Tuple[dict[str, str], dict[str, str]]]
+    ]:
+        l_mapping = {  # Identity mapping, only rename right side
+            lcol.name: lcol.name for lcol in self.node.ids
+        }
+        other_node, r_mapping = self.prepare_join_names(other)
+        import bigframes.core.rewrite
+
+        result_node = bigframes.core.rewrite.try_row_join(
+            self.node, other_node, conditions
+        )
+        if result_node is None:
+            return None
+
+        return (
+            ArrayValue(result_node),
+            (l_mapping, r_mapping),
+        )
+
+    def prepare_join_names(
+        self, other: ArrayValue
+    ) -> Tuple[bigframes.core.nodes.BigFrameNode, dict[str, str]]:
+        if set(other.node.ids) & set(self.node.ids):
+            r_mapping = {  # Rename conflicting names
+                rcol.name: rcol.name
+                if (rcol.name not in self.column_ids)
+                else bigframes.core.guid.generate_guid()
+                for rcol in other.node.ids
+            }
+            return (
+                nodes.SelectionNode(
+                    other.node,
+                    tuple(
+                        (ex.deref(old_id), ids.ColumnId(new_id))
+                        for old_id, new_id in r_mapping.items()
+                    ),
+                ),
+                r_mapping,
+            )
+        else:
+            return other.node, {id: id for id in other.column_ids}
+
+    def try_legacy_row_join(
+        self,
+        other: ArrayValue,
+        join_type: join_def.JoinType,
+        join_keys: typing.Tuple[join_def.CoalescedColumnMapping, ...],
+        mappings: typing.Tuple[join_def.JoinColumnMapping, ...],
+    ) -> typing.Optional[ArrayValue]:
+        import bigframes.core.rewrite
+
+        result = bigframes.core.rewrite.legacy_join_as_projection(
+            self.node, other.node, join_keys, mappings, join_type
+        )
+        if result is not None:
+            return ArrayValue(result)
+        return None
+
+    def explode(self, column_ids: typing.Sequence[str]) -> ArrayValue:
+        assert len(column_ids) > 0
+        for column_id in column_ids:
+            assert bigframes.dtypes.is_array_like(self.get_column_type(column_id))
+
+        offsets = tuple(ex.deref(id) for id in column_ids)
+        return ArrayValue(nodes.ExplodeNode(child=self.node, column_ids=offsets))
 
     def _uniform_sampling(self, fraction: float) -> ArrayValue:
         """Sampling the table on given fraction.
@@ -367,3 +515,14 @@ class ArrayValue:
             The row numbers of result is non-deterministic, avoid to use.
         """
         return ArrayValue(nodes.RandomSampleNode(self.node, fraction))
+
+    # Deterministically generate namespaced ids for new variables
+    # These new ids are only unique within the current namespace.
+    # Many operations, such as joins, create new namespaces. See: BigFrameNode.defines_namespace
+    # When migrating to integer ids, these will generate the next available integer, in order to densely pack ids
+    # this will help represent variables sets as compact bitsets
+    def _gen_namespaced_uid(self) -> str:
+        return self._gen_namespaced_uids(1)[0]
+
+    def _gen_namespaced_uids(self, n: int) -> List[str]:
+        return [ids.ColumnId.unique().name for _ in range(n)]

@@ -16,14 +16,15 @@ from __future__ import annotations
 import math
 import typing
 
-import ibis
+import bigframes_vendored.ibis.expr.api as ibis_api
 
 import bigframes.core.compile.compiled as compiled
+import bigframes.core.expression as ex
 from bigframes.core.ordering import (
-    ExpressionOrdering,
-    OrderingColumnReference,
+    ascending_over,
     reencode_order_string,
     StringEncoding,
+    TotalOrdering,
 )
 
 ORDER_ID_COLUMN = "bigframes_ordering_id"
@@ -31,6 +32,7 @@ ORDER_ID_COLUMN = "bigframes_ordering_id"
 
 def concat_unordered(
     items: typing.Sequence[compiled.UnorderedIR],
+    output_ids: typing.Sequence[str],
 ) -> compiled.UnorderedIR:
     """Append together multiple ArrayValue objects."""
     if len(items) == 1:
@@ -38,12 +40,11 @@ def concat_unordered(
     tables = []
     for expr in items:
         table = expr._to_ibis_expr()
-        # Rename the value columns based on horizontal offset before applying union.
         table = table.select(
-            [table[col].name(f"column_{i}") for i, col in enumerate(table.columns)]
+            [table[col].name(id) for id, col in zip(output_ids, table.columns)]
         )
         tables.append(table)
-    combined_table = ibis.union(*tables)
+    combined_table = ibis_api.union(*tables)
     return compiled.UnorderedIR(
         combined_table,
         columns=[combined_table[col] for col in combined_table.columns],
@@ -52,6 +53,7 @@ def concat_unordered(
 
 def concat_ordered(
     items: typing.Sequence[compiled.OrderedIR],
+    output_ids: typing.Sequence[str],
 ) -> compiled.OrderedIR:
     """Append together multiple ArrayValue objects."""
     if len(items) == 1:
@@ -66,26 +68,29 @@ def concat_ordered(
     )
     for i, expr in enumerate(items):
         ordering_prefix = str(i).zfill(prefix_size)
+        renames = {
+            old_id: new_id for old_id, new_id in zip(expr.column_ids, output_ids)
+        }
         table = expr._to_ibis_expr(
-            ordering_mode="string_encoded", order_col_name=ORDER_ID_COLUMN
+            ordering_mode="string_encoded",
+            order_col_name=ORDER_ID_COLUMN,
         )
-        # Rename the value columns based on horizontal offset before applying union.
         table = table.select(
             [
-                table[col].name(f"column_{i}")
+                table[col].name(renames[col])
                 if col != ORDER_ID_COLUMN
                 else (
                     ordering_prefix
                     + reencode_order_string(table[ORDER_ID_COLUMN], max_encoding_size)
                 ).name(ORDER_ID_COLUMN)
-                for i, col in enumerate(table.columns)
+                for col in table.columns
             ]
         )
         tables.append(table)
-    combined_table = ibis.union(*tables)
-    ordering = ExpressionOrdering(
-        ordering_value_columns=tuple([OrderingColumnReference(ORDER_ID_COLUMN)]),
-        total_ordering_columns=frozenset([ORDER_ID_COLUMN]),
+    combined_table = ibis_api.union(*tables)
+    ordering = TotalOrdering(
+        ordering_value_columns=tuple([ascending_over(ORDER_ID_COLUMN)]),
+        total_ordering_columns=frozenset([ex.deref(ORDER_ID_COLUMN)]),
         string_encoding=StringEncoding(True, prefix_size + max_encoding_size),
     )
     return compiled.OrderedIR(

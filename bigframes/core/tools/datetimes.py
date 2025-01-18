@@ -16,19 +16,19 @@ from collections.abc import Mapping
 from datetime import datetime
 from typing import Optional, Union
 
+import bigframes_vendored.constants as constants
+import bigframes_vendored.pandas.core.tools.datetimes as vendored_pandas_datetimes
 import pandas as pd
 
-import bigframes.constants as constants
-import bigframes.core.global_session as global_session
 import bigframes.dataframe
+import bigframes.dtypes
 import bigframes.operations as ops
 import bigframes.series
-import third_party.bigframes_vendored.pandas.core.tools.datetimes as vendored_pandas_datetimes
 
 
 def to_datetime(
     arg: Union[
-        vendored_pandas_datetimes.local_scalars,
+        Union[int, float, str, datetime],
         vendored_pandas_datetimes.local_iterables,
         bigframes.series.Series,
         bigframes.dataframe.DataFrame,
@@ -52,31 +52,68 @@ def to_datetime(
             f"to datetime is not implemented. {constants.FEEDBACK_LINK}"
         )
 
-    if not isinstance(arg, bigframes.series.Series):
-        # This block ensures compatibility with local data formats, including
-        # iterables and pandas.Series
-        # TODO: Currently, data upload is performed using pandas DataFrames
-        # combined with the `read_pandas` method due to the BigFrames DataFrame
-        # constructor's limitations in handling various data types. Plan to update
-        # the upload process to utilize the BigFrames DataFrame constructor directly
-        # once it is enhanced for more related datatypes.
-        arg = global_session.with_default_session(
-            bigframes.session.Session.read_pandas, pd.DataFrame(arg)
-        )
-        if len(arg.columns) != 1:
-            raise ValueError("Input must be 1-dimensional.")
+    arg = bigframes.series.Series(arg)._cached()
 
-        arg = arg[arg.columns[0]]
+    if format and unit and arg.dtype in (bigframes.dtypes.INT_DTYPE, bigframes.dtypes.FLOAT_DTYPE):  # type: ignore
+        raise ValueError("cannot specify both format and unit")
 
-    if not utc and arg.dtype not in ("Int64", "Float64"):  # type: ignore
+    if unit and arg.dtype not in (bigframes.dtypes.INT_DTYPE, bigframes.dtypes.FLOAT_DTYPE):  # type: ignore
         raise NotImplementedError(
-            f"String and Timestamp requires utc=True. {constants.FEEDBACK_LINK}"
+            f"Unit parameter is not supported for non-numerical input types. {constants.FEEDBACK_LINK}"
         )
 
-    return arg._apply_unary_op(  # type: ignore
-        ops.ToDatetimeOp(
-            utc=utc,
-            format=format,
-            unit=unit,
+    if arg.dtype in (bigframes.dtypes.TIMESTAMP_DTYPE, bigframes.dtypes.DATETIME_DTYPE):
+        to_type = (
+            bigframes.dtypes.TIMESTAMP_DTYPE if utc else bigframes.dtypes.DATETIME_DTYPE
         )
-    )
+        return arg._apply_unary_op(ops.AsTypeOp(to_type=to_type))  # type: ignore
+    if (not utc) and arg.dtype == bigframes.dtypes.STRING_DTYPE:
+        if format:
+            raise NotImplementedError(
+                f"Customized formats are not supported for string inputs when utc=False. Please set utc=True if possible. {constants.FEEDBACK_LINK}"
+            )
+
+        assert unit is None
+        as_datetime = arg._apply_unary_op(  # type: ignore
+            ops.ToDatetimeOp(
+                format=format,
+                unit=unit,
+            )
+        )
+        failed_datetime_cast = arg.notnull() & as_datetime.isnull()
+        is_utc = arg._apply_unary_op(
+            ops.EndsWithOp(
+                pat=("Z", "-00:00", "+00:00", "-0000", "+0000", "-00", "+00")
+            )
+        )
+
+        # Cast to DATETIME shall succeed if all inputs are tz-naive.
+        if not failed_datetime_cast.any():
+            return as_datetime
+
+        if is_utc.all():
+            return arg._apply_unary_op(  # type: ignore
+                ops.ToTimestampOp(
+                    format=format,
+                    unit=unit,
+                )
+            )
+
+        raise NotImplementedError(
+            f"Non-UTC string inputs are not supported when utc=False. Please set utc=True if possible. {constants.FEEDBACK_LINK}"
+        )
+    # If utc:
+    elif utc:
+        return arg._apply_unary_op(  # type: ignore
+            ops.ToTimestampOp(
+                format=format,
+                unit=unit,
+            )
+        )
+    else:
+        return arg._apply_unary_op(  # type: ignore
+            ops.ToDatetimeOp(
+                format=format,
+                unit=unit,
+            )
+        )

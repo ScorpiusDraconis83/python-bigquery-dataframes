@@ -16,27 +16,26 @@
 
 from __future__ import annotations
 
-from typing import Mapping, Optional, Union
+from typing import Mapping, Optional
 import warnings
 
-import bigframes
 from bigframes import clients
-from bigframes.core import log_adapter
+from bigframes.core import global_session, log_adapter
+import bigframes.dataframe
 from bigframes.ml import base, core, globals, utils
-from bigframes.ml.globals import _SUPPORTED_DTYPES
-import bigframes.pandas as bpd
+import bigframes.session
 
 _REMOTE_MODEL_STATUS = "remote_model_status"
 
 
 @log_adapter.class_logger
 class VertexAIModel(base.BaseEstimator):
-    """Remote model from a Vertex AI https endpoint. User must specify https endpoint, input schema and output schema.
-    How to deploy a model in Vertex AI https://cloud.google.com/bigquery/docs/bigquery-ml-remote-model-tutorial#Deploy-Model-on-Vertex-AI.
+    """Remote model from a Vertex AI HTTPS endpoint. User must specify HTTPS endpoint, input schema and output schema.
+    For more information, see Deploy model on Vertex AI: https://cloud.google.com/bigquery/docs/bigquery-ml-remote-model-tutorial#Deploy-Model-on-Vertex-AI.
 
     Args:
         endpoint (str):
-            Vertex AI https endpoint.
+            Vertex AI HTTPS endpoint.
         input (Mapping):
             Input schema: `{column_name: column_type}`. Supported types are "bool", "string", "int64", "float64", "array<bool>", "array<string>", "array<int64>", "array<float64>".
         output (Mapping):
@@ -45,8 +44,8 @@ class VertexAIModel(base.BaseEstimator):
             BQ session to create the model. If None, use the global default session.
         connection_name (str or None):
             Connection to connect with remote service. str of the format <PROJECT_NUMBER/PROJECT_ID>.<LOCATION>.<CONNECTION_ID>.
-            if None, use default connection in session context. BigQuery DataFrame will try to create the connection and attach
-            permission if the connection isn't fully setup.
+            If None, use default connection in session context. BigQuery DataFrame will try to create the connection and attach
+            permission if the connection isn't fully set up.
     """
 
     def __init__(
@@ -54,19 +53,18 @@ class VertexAIModel(base.BaseEstimator):
         endpoint: str,
         input: Mapping[str, str],
         output: Mapping[str, str],
-        session: Optional[bigframes.Session] = None,
+        *,
+        session: Optional[bigframes.session.Session] = None,
         connection_name: Optional[str] = None,
     ):
         self.endpoint = endpoint
         self.input = input
         self.output = output
-        self.session = session or bpd.get_global_session()
+        self.session = session or global_session.get_global_session()
 
-        self._bq_connection_manager = clients.BqConnectionManager(
-            self.session.bqconnectionclient, self.session.resourcemanagerclient
-        )
+        self._bq_connection_manager = self.session.bqconnectionmanager
         connection_name = connection_name or self.session._bq_connection
-        self.connection_name = self._bq_connection_manager.resolve_full_connection_name(
+        self.connection_name = clients.resolve_full_bq_connection_name(
             connection_name,
             default_project=self.session._project,
             default_location=self.session._location,
@@ -81,17 +79,19 @@ class VertexAIModel(base.BaseEstimator):
             raise ValueError(
                 "Must provide connection_name, either in constructor or through session options."
             )
-        connection_name_parts = self.connection_name.split(".")
-        if len(connection_name_parts) != 3:
-            raise ValueError(
-                f"connection_name must be of the format <PROJECT_NUMBER/PROJECT_ID>.<LOCATION>.<CONNECTION_ID>, got {self.connection_name}."
+
+        if self._bq_connection_manager:
+            connection_name_parts = self.connection_name.split(".")
+            if len(connection_name_parts) != 3:
+                raise ValueError(
+                    f"connection_name must be of the format <PROJECT_NUMBER/PROJECT_ID>.<LOCATION>.<CONNECTION_ID>, got {self.connection_name}."
+                )
+            self._bq_connection_manager.create_bq_connection(
+                project_id=connection_name_parts[0],
+                location=connection_name_parts[1],
+                connection_id=connection_name_parts[2],
+                iam_role="aiplatform.user",
             )
-        self._bq_connection_manager.create_bq_connection(
-            project_id=connection_name_parts[0],
-            location=connection_name_parts[1],
-            connection_id=connection_name_parts[2],
-            iam_role="aiplatform.user",
-        )
 
         options = {
             "endpoint": self.endpoint,
@@ -101,9 +101,9 @@ class VertexAIModel(base.BaseEstimator):
             v = v.lower()
             v = v.replace("boolean", "bool")
 
-            if v not in _SUPPORTED_DTYPES:
+            if v not in globals._SUPPORTED_DTYPES:
                 raise ValueError(
-                    f"Data type {v} is not supported. We only support {', '.join(_SUPPORTED_DTYPES)}."
+                    f"Data type {v} is not supported. We only support {', '.join(globals._SUPPORTED_DTYPES)}."
                 )
 
             return v
@@ -121,27 +121,28 @@ class VertexAIModel(base.BaseEstimator):
 
     def predict(
         self,
-        X: Union[bpd.DataFrame, bpd.Series],
-    ) -> bpd.DataFrame:
+        X: utils.ArrayType,
+    ) -> bigframes.dataframe.DataFrame:
         """Predict the result from the input DataFrame.
 
         Args:
-            X (bigframes.dataframe.DataFrame or bigframes.series.Series):
+            X (bigframes.pandas.DataFrame or bigframes.pandas.Series or pandas.DataFrame or pandas.Series):
                 Input DataFrame or Series, which needs to comply with the input parameter of the model.
 
         Returns:
-            bigframes.dataframe.DataFrame: DataFrame of shape (n_samples, n_input_columns + n_prediction_columns). Returns predicted values.
+            bigframes.pandas.DataFrame: DataFrame of shape (n_samples, n_input_columns + n_prediction_columns). Returns predicted values.
         """
 
-        (X,) = utils.convert_to_dataframe(X)
+        (X,) = utils.batch_convert_to_dataframe(X, session=self._bqml_model.session)
 
         df = self._bqml_model.predict(X)
 
         # unlike LLM models, the general remote model status is null for successful runs.
         if (df[_REMOTE_MODEL_STATUS].notna()).any():
-            warnings.warn(
-                f"Some predictions failed. Check column {_REMOTE_MODEL_STATUS} for detailed status. You may want to filter the failed rows and retry.",
-                RuntimeWarning,
+            msg = (
+                f"Some predictions failed. Check column {_REMOTE_MODEL_STATUS} for "
+                "detailed status. You may want to filter the failed rows and retry."
             )
+            warnings.warn(msg, category=RuntimeWarning)
 
         return df

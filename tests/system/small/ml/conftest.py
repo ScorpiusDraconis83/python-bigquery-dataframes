@@ -35,11 +35,6 @@ from bigframes.ml import (
 
 
 @pytest.fixture(scope="session")
-def bq_connection(bigquery_client) -> str:
-    return f"{bigquery_client.project}.us.bigframes-rf-conn"
-
-
-@pytest.fixture(scope="session")
 def penguins_bqml_linear_model(session, penguins_linear_model_name) -> core.BqmlModel:
     model = session.bqclient.get_model(penguins_linear_model_name)
     return core.BqmlModel(session, model)
@@ -47,12 +42,11 @@ def penguins_bqml_linear_model(session, penguins_linear_model_name) -> core.Bqml
 
 @pytest.fixture(scope="function")
 def ephemera_penguins_bqml_linear_model(
-    penguins_bqml_linear_model,
+    session: bigframes.Session,
+    penguins_bqml_linear_model: core.BqmlModel,
 ) -> core.BqmlModel:
     model = penguins_bqml_linear_model
-    return model.copy(
-        f"{model._model.project}.{model._model.dataset_id}.{uuid.uuid4().hex}"
-    )
+    return model.copy(f"{session._anonymous_dataset}.{uuid.uuid4().hex}")
 
 
 @pytest.fixture(scope="session")
@@ -159,20 +153,6 @@ def penguins_pca_model(
 
 
 @pytest.fixture(scope="session")
-def llm_text_pandas_df():
-    """Additional data matching the penguins dataset, with a new index"""
-    return pd.DataFrame(
-        {
-            "prompt": [
-                "What is BigQuery?",
-                "What is BQML?",
-                "What is BigQuery DataFrame?",
-            ],
-        }
-    )
-
-
-@pytest.fixture(scope="session")
 def onnx_iris_pandas_df():
     """Data matching the iris dataset."""
     return pd.DataFrame(
@@ -214,11 +194,6 @@ def xgboost_iris_df(session, xgboost_iris_pandas_df):
 
 
 @pytest.fixture(scope="session")
-def llm_text_df(session, llm_text_pandas_df):
-    return session.read_pandas(llm_text_pandas_df)
-
-
-@pytest.fixture(scope="session")
 def bqml_palm2_text_generator_model(session, bq_connection) -> core.BqmlModel:
     options = {
         "remote_service_type": "CLOUD_AI_LARGE_LANGUAGE_MODEL_V1",
@@ -257,6 +232,15 @@ def palm2_embedding_generator_model(
 
 
 @pytest.fixture(scope="session")
+def palm2_embedding_generator_model_002(
+    session, bq_connection
+) -> llm.PaLM2TextEmbeddingGenerator:
+    return llm.PaLM2TextEmbeddingGenerator(
+        version="002", session=session, connection_name=bq_connection
+    )
+
+
+@pytest.fixture(scope="session")
 def palm2_embedding_generator_multilingual_model(
     session, bq_connection
 ) -> llm.PaLM2TextEmbeddingGenerator:
@@ -265,11 +249,6 @@ def palm2_embedding_generator_multilingual_model(
         session=session,
         connection_name=bq_connection,
     )
-
-
-@pytest.fixture(scope="session")
-def gemini_text_generator_model(session, bq_connection) -> llm.GeminiTextGenerator:
-    return llm.GeminiTextGenerator(session=session, connection_name=bq_connection)
 
 
 @pytest.fixture(scope="session")

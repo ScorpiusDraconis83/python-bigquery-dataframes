@@ -18,10 +18,13 @@ from dataclasses import dataclass, field
 from enum import Enum
 import math
 import typing
-from typing import Optional, Sequence
+from typing import Mapping, Optional, Sequence, Set
 
-import ibis.expr.datatypes as ibis_dtypes
-import ibis.expr.types as ibis_types
+import bigframes_vendored.ibis.expr.datatypes as ibis_dtypes
+import bigframes_vendored.ibis.expr.types as ibis_types
+
+import bigframes.core.expression as expression
+import bigframes.core.identifiers as ids
 
 # TODO(tbergeron): Encode more efficiently
 ORDERING_ID_STRING_BASE: int = 10
@@ -45,19 +48,47 @@ class OrderingDirection(Enum):
 
 
 @dataclass(frozen=True)
-class OrderingColumnReference:
+class OrderingExpression:
     """References a column and how to order with respect to values in that column."""
 
-    column_id: str
+    scalar_expression: expression.Expression
     direction: OrderingDirection = OrderingDirection.ASC
     na_last: bool = True
 
-    def with_name(self, name: str):
-        return OrderingColumnReference(name, self.direction, self.na_last)
+    @property
+    def referenced_columns(self) -> Set[ids.ColumnId]:
+        return set(self.scalar_expression.column_references)
 
-    def with_reverse(self):
-        return OrderingColumnReference(
-            self.column_id, self.direction.reverse(), not self.na_last
+    @property
+    def deterministic(self) -> bool:
+        return self.scalar_expression.deterministic
+
+    def remap_column_refs(
+        self,
+        mapping: Mapping[ids.ColumnId, ids.ColumnId],
+        allow_partial_bindings: bool = False,
+    ) -> OrderingExpression:
+        return self.bind_refs(
+            {old_id: expression.DerefOp(new_id) for old_id, new_id in mapping.items()},
+            allow_partial_bindings=allow_partial_bindings,
+        )
+
+    def bind_refs(
+        self,
+        mapping: Mapping[ids.ColumnId, expression.Expression],
+        allow_partial_bindings: bool = False,
+    ) -> OrderingExpression:
+        return OrderingExpression(
+            self.scalar_expression.bind_refs(
+                mapping, allow_partial_bindings=allow_partial_bindings
+            ),
+            self.direction,
+            self.na_last,
+        )
+
+    def with_reverse(self) -> OrderingExpression:
+        return OrderingExpression(
+            self.scalar_expression, self.direction.reverse(), not self.na_last
         )
 
 
@@ -81,115 +112,24 @@ class IntegerEncoding:
 
 
 @dataclass(frozen=True)
-class ExpressionOrdering:
-    """Immutable object that holds information about the ordering of rows in a ArrayValue object."""
+class RowOrdering:
+    """Immutable object that holds information about the ordering of rows in a ArrayValue object. May not be unambiguous."""
 
-    ordering_value_columns: typing.Tuple[OrderingColumnReference, ...] = ()
+    ordering_value_columns: typing.Tuple[OrderingExpression, ...] = ()
     integer_encoding: IntegerEncoding = IntegerEncoding(False)
     string_encoding: StringEncoding = StringEncoding(False)
-    # A table has a total ordering defined by the identities of a set of 1 or more columns.
-    # These columns must always be part of the ordering, in order to guarantee that the ordering is total.
-    # Therefore, any modifications(or drops) done to these columns must result in hidden copies being made.
-    total_ordering_columns: frozenset[str] = field(default_factory=frozenset)
-
-    @classmethod
-    def from_offset_col(cls, col: str) -> ExpressionOrdering:
-        return ExpressionOrdering(
-            (OrderingColumnReference(col),),
-            integer_encoding=IntegerEncoding(True, is_sequential=True),
-            total_ordering_columns=frozenset({col}),
-        )
-
-    def with_non_sequential(self):
-        """Create a copy that is marked as non-sequential.
-
-        This is useful when filtering, but not sorting, an expression.
-        """
-        if self.integer_encoding.is_sequential:
-            return ExpressionOrdering(
-                self.ordering_value_columns,
-                integer_encoding=IntegerEncoding(
-                    self.integer_encoding.is_encoded, is_sequential=False
-                ),
-                total_ordering_columns=self.total_ordering_columns,
-            )
-
-        return self
-
-    def with_ordering_columns(
-        self,
-        ordering_value_columns: Sequence[OrderingColumnReference] = (),
-    ) -> ExpressionOrdering:
-        """Creates a new ordering that reorders by the given columns.
-
-        Args:
-            ordering_value_columns:
-                In decreasing precedence order, the values used to sort the ordering
-
-        Returns:
-            Modified ExpressionOrdering
-        """
-        col_ids_new = [
-            ordering_ref.column_id for ordering_ref in ordering_value_columns
-        ]
-        old_ordering_keep = [
-            ordering_ref
-            for ordering_ref in self.ordering_value_columns
-            if ordering_ref.column_id not in col_ids_new
-        ]
-
-        # Truncate to remove any unneded col references after all total order cols included
-        new_ordering = self._truncate_ordering(
-            (*ordering_value_columns, *old_ordering_keep)
-        )
-        return ExpressionOrdering(
-            new_ordering,
-            total_ordering_columns=self.total_ordering_columns,
-        )
-
-    def _truncate_ordering(
-        self, order_refs: tuple[OrderingColumnReference, ...]
-    ) -> tuple[OrderingColumnReference, ...]:
-        total_order_cols_remaining = set(self.total_ordering_columns)
-        for i in range(len(order_refs)):
-            column = order_refs[i].column_id
-            if column in total_order_cols_remaining:
-                total_order_cols_remaining.remove(column)
-            if len(total_order_cols_remaining) == 0:
-                return order_refs[: i + 1]
-        raise ValueError("Ordering did not contain all total_order_cols")
-
-    def with_reverse(self):
-        """Reverses the ordering."""
-        return ExpressionOrdering(
-            tuple([col.with_reverse() for col in self.ordering_value_columns]),
-            total_ordering_columns=self.total_ordering_columns,
-        )
-
-    def with_column_remap(self, mapping: typing.Mapping[str, str]):
-        new_value_columns = [
-            col.with_name(mapping.get(col.column_id, col.column_id))
-            for col in self.ordering_value_columns
-        ]
-        new_total_order = frozenset(
-            mapping.get(col_id, col_id) for col_id in self.total_ordering_columns
-        )
-        return ExpressionOrdering(
-            tuple(new_value_columns),
-            integer_encoding=self.integer_encoding,
-            string_encoding=self.string_encoding,
-            total_ordering_columns=new_total_order,
-        )
 
     @property
-    def total_order_col(self) -> Optional[OrderingColumnReference]:
-        """Returns column id of columns that defines total ordering, if such as column exists"""
-        if len(self.ordering_value_columns) != 1:
-            return None
-        order_ref = self.ordering_value_columns[0]
-        if order_ref.direction != OrderingDirection.ASC:
-            return None
-        return order_ref
+    def all_ordering_columns(self) -> Sequence[OrderingExpression]:
+        return list(self.ordering_value_columns)
+
+    @property
+    def referenced_columns(self) -> Set[ids.ColumnId]:
+        return set(
+            col
+            for part in self.ordering_value_columns
+            for col in part.referenced_columns
+        )
 
     @property
     def is_string_encoded(self) -> bool:
@@ -201,8 +141,220 @@ class ExpressionOrdering:
         return self.integer_encoding.is_encoded and self.integer_encoding.is_sequential
 
     @property
-    def all_ordering_columns(self) -> Sequence[OrderingColumnReference]:
-        return list(self.ordering_value_columns)
+    def is_total_ordering(self) -> bool:
+        return False
+
+    @property
+    def total_order_col(self) -> Optional[OrderingExpression]:
+        """Returns column id of columns that defines total ordering, if such as column exists"""
+        return None
+
+    def with_reverse(self) -> RowOrdering:
+        """Reverses the ordering."""
+        return RowOrdering(
+            tuple([col.with_reverse() for col in self.ordering_value_columns]),
+        )
+
+    def remap_column_refs(
+        self,
+        mapping: typing.Mapping[ids.ColumnId, ids.ColumnId],
+        allow_partial_bindings: bool = False,
+    ) -> RowOrdering:
+        new_value_columns = [
+            col.remap_column_refs(
+                mapping, allow_partial_bindings=allow_partial_bindings
+            )
+            for col in self.all_ordering_columns
+        ]
+        return RowOrdering(
+            tuple(new_value_columns),
+        )
+
+    def with_non_sequential(self):
+        """Create a copy that is marked as non-sequential.
+
+        This is useful when filtering, but not sorting, an expression.
+        """
+        if self.integer_encoding.is_sequential:
+            return RowOrdering(
+                self.ordering_value_columns,
+                integer_encoding=IntegerEncoding(
+                    self.integer_encoding.is_encoded, is_sequential=False
+                ),
+            )
+
+        return self
+
+    def with_ordering_columns(
+        self,
+        ordering_value_columns: Sequence[OrderingExpression] = (),
+    ) -> RowOrdering:
+        """Creates a new ordering that reorders by the given columns.
+
+        Args:
+            ordering_value_columns:
+                In decreasing precedence order, the values used to sort the ordering
+
+        Returns:
+            Modified ExpressionOrdering
+        """
+
+        # Truncate to remove any unneded col references after all total order cols included
+        new_ordering = self._truncate_ordering(
+            (*ordering_value_columns, *self.ordering_value_columns)
+        )
+        return RowOrdering(
+            new_ordering,
+        )
+
+    def _truncate_ordering(
+        self, order_refs: tuple[OrderingExpression, ...]
+    ) -> tuple[OrderingExpression, ...]:
+        # Truncate once we refer to a full key in bijective operations
+        columns_seen: Set[ids.ColumnId] = set()
+        truncated_refs = []
+        for order_part in order_refs:
+            expr = order_part.scalar_expression
+            if not set(expr.column_references).issubset(columns_seen):
+                if expr.is_bijective:
+                    columns_seen.update(expr.column_references)
+                truncated_refs.append(order_part)
+        return tuple(truncated_refs)
+
+
+@dataclass(frozen=True)
+class TotalOrdering(RowOrdering):
+    """Immutable object that holds information about the ordering of rows in a ArrayValue object. Guaranteed to be unambiguous."""
+
+    def __post_init__(self):
+        assert set(ref.id for ref in self.total_ordering_columns).issubset(
+            self.referenced_columns
+        )
+
+    # A table has a total ordering defined by the identities of a set of 1 or more columns.
+    # These columns must always be part of the ordering, in order to guarantee that the ordering is total.
+    # Therefore, any modifications(or drops) done to these columns must result in hidden copies being made.
+    total_ordering_columns: frozenset[expression.DerefOp] = field(
+        default_factory=frozenset
+    )
+
+    @classmethod
+    def from_offset_col(cls, col: str) -> TotalOrdering:
+        return TotalOrdering(
+            (ascending_over(col),),
+            integer_encoding=IntegerEncoding(True, is_sequential=True),
+            total_ordering_columns=frozenset({expression.deref(col)}),
+        )
+
+    @classmethod
+    def from_primary_key(cls, primary_key: Sequence[str]) -> TotalOrdering:
+        return TotalOrdering(
+            tuple(ascending_over(col) for col in primary_key),
+            total_ordering_columns=frozenset(
+                {expression.deref(col) for col in primary_key}
+            ),
+        )
+
+    @property
+    def is_total_ordering(self) -> bool:
+        return True
+
+    def with_non_sequential(self):
+        """Create a copy that is marked as non-sequential.
+
+        This is useful when filtering, but not sorting, an expression.
+        """
+        if self.integer_encoding.is_sequential:
+            return TotalOrdering(
+                self.ordering_value_columns,
+                integer_encoding=IntegerEncoding(
+                    self.integer_encoding.is_encoded, is_sequential=False
+                ),
+                total_ordering_columns=self.total_ordering_columns,
+            )
+
+        return self
+
+    def with_ordering_columns(
+        self,
+        ordering_value_columns: Sequence[OrderingExpression] = (),
+    ) -> TotalOrdering:
+        """Creates a new ordering that reorders by the given columns.
+
+        Args:
+            ordering_value_columns:
+                In decreasing precedence order, the values used to sort the ordering
+
+        Returns:
+            Modified ExpressionOrdering
+        """
+
+        # Truncate to remove any unneded col references after all total order cols included
+        new_ordering = self._truncate_ordering(
+            (*ordering_value_columns, *self.ordering_value_columns)
+        )
+        return TotalOrdering(
+            new_ordering,
+            total_ordering_columns=self.total_ordering_columns,
+        )
+
+    def _truncate_ordering(
+        self, order_refs: tuple[OrderingExpression, ...]
+    ) -> tuple[OrderingExpression, ...]:
+        # Truncate once we refer to a full key in bijective operations
+        must_see = set(ref.id for ref in self.total_ordering_columns)
+        columns_seen: Set[ids.ColumnId] = set()
+        truncated_refs = []
+        for order_part in order_refs:
+            expr = order_part.scalar_expression
+            if not set(expr.column_references).issubset(columns_seen):
+                if expr.is_bijective:
+                    columns_seen.update(expr.column_references)
+                truncated_refs.append(order_part)
+                if columns_seen.issuperset(must_see):
+                    return tuple(truncated_refs)
+        if len(must_see) == 0:
+            return ()
+        raise ValueError("Ordering did not contain all total_order_cols")
+
+    def with_reverse(self):
+        """Reverses the ordering."""
+        return TotalOrdering(
+            tuple([col.with_reverse() for col in self.ordering_value_columns]),
+            total_ordering_columns=self.total_ordering_columns,
+        )
+
+    def remap_column_refs(
+        self,
+        mapping: typing.Mapping[ids.ColumnId, ids.ColumnId],
+        allow_partial_bindings: bool = False,
+    ):
+        new_value_columns = [
+            col.remap_column_refs(
+                mapping, allow_partial_bindings=allow_partial_bindings
+            )
+            for col in self.all_ordering_columns
+        ]
+        new_total_order = frozenset(
+            expression.DerefOp(mapping.get(col_id.id, col_id.id))
+            for col_id in self.total_ordering_columns
+        )
+        return TotalOrdering(
+            tuple(new_value_columns),
+            integer_encoding=self.integer_encoding,
+            string_encoding=self.string_encoding,
+            total_ordering_columns=new_total_order,
+        )
+
+    @property
+    def total_order_col(self) -> Optional[OrderingExpression]:
+        """Returns column id of columns that defines total ordering, if such as column exists"""
+        if len(self.ordering_value_columns) != 1:
+            return None
+        order_ref = self.ordering_value_columns[0]
+        if order_ref.direction != OrderingDirection.ASC:
+            return None
+        return order_ref
 
 
 def encode_order_string(
@@ -227,3 +379,71 @@ def reencode_order_string(
         ibis_types.StringColumn,
         (typing.cast(ibis_types.StringValue, order_id).lpad(length, "0")),
     )
+
+
+# Convenience functions
+def ascending_over(id: str, nulls_last: bool = True) -> OrderingExpression:
+    return OrderingExpression(expression.deref(id), na_last=nulls_last)
+
+
+def descending_over(id: str, nulls_last: bool = True) -> OrderingExpression:
+    return OrderingExpression(
+        expression.deref(id), direction=OrderingDirection.DESC, na_last=nulls_last
+    )
+
+
+@typing.overload
+def join_orderings(
+    left: TotalOrdering,
+    right: TotalOrdering,
+    left_id_mapping: Mapping[ids.ColumnId, ids.ColumnId],
+    right_id_mapping: Mapping[ids.ColumnId, ids.ColumnId],
+    left_order_dominates: bool = True,
+) -> TotalOrdering:
+    ...
+
+
+@typing.overload
+def join_orderings(
+    left: RowOrdering,
+    right: RowOrdering,
+    left_id_mapping: Mapping[ids.ColumnId, ids.ColumnId],
+    right_id_mapping: Mapping[ids.ColumnId, ids.ColumnId],
+    left_order_dominates: bool = True,
+) -> RowOrdering:
+    ...
+
+
+def join_orderings(
+    left: RowOrdering,
+    right: RowOrdering,
+    left_id_mapping: Mapping[ids.ColumnId, ids.ColumnId],
+    right_id_mapping: Mapping[ids.ColumnId, ids.ColumnId],
+    left_order_dominates: bool = True,
+) -> RowOrdering:
+    left_ordering_refs = [
+        ref.remap_column_refs(left_id_mapping) for ref in left.all_ordering_columns
+    ]
+    right_ordering_refs = [
+        ref.remap_column_refs(right_id_mapping) for ref in right.all_ordering_columns
+    ]
+    if left_order_dominates:
+        joined_refs = [*left_ordering_refs, *right_ordering_refs]
+    else:
+        joined_refs = [*right_ordering_refs, *left_ordering_refs]
+
+    if isinstance(left, TotalOrdering) and isinstance(right, TotalOrdering):
+        left_total_order_cols = frozenset(
+            [left_id_mapping[ref.id] for ref in left.total_ordering_columns]
+        )
+        right_total_order_cols = frozenset(
+            [right_id_mapping[ref.id] for ref in right.total_ordering_columns]
+        )
+        return TotalOrdering(
+            ordering_value_columns=tuple(joined_refs),
+            total_ordering_columns=frozenset(
+                map(expression.DerefOp, left_total_order_cols | right_total_order_cols)
+            ),
+        )
+    else:
+        return RowOrdering(tuple(joined_refs))

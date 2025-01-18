@@ -15,12 +15,17 @@ from __future__ import annotations
 
 import dataclasses
 import enum
-from typing import Literal, Mapping, NamedTuple, Tuple
+from typing import Literal, NamedTuple
 
 
 class JoinSide(enum.Enum):
     LEFT = 0
     RIGHT = 1
+
+    def inverse(self) -> JoinSide:
+        if self == JoinSide.LEFT:
+            return JoinSide.RIGHT
+        return JoinSide.LEFT
 
 
 JoinType = Literal["inner", "outer", "left", "right", "cross"]
@@ -39,21 +44,9 @@ class JoinColumnMapping:
 
 
 @dataclasses.dataclass(frozen=True)
-class JoinDefinition:
-    conditions: Tuple[JoinCondition, ...]
-    mappings: Tuple[JoinColumnMapping, ...]
-    type: JoinType
+class CoalescedColumnMapping:
+    """Special column mapping used only by implicit joiner only"""
 
-    def get_left_mapping(self) -> Mapping[str, str]:
-        return {
-            i.source_id: i.destination_id
-            for i in self.mappings
-            if i.source_table == JoinSide.LEFT
-        }
-
-    def get_right_mapping(self) -> Mapping[str, str]:
-        return {
-            i.source_id: i.destination_id
-            for i in self.mappings
-            if i.source_table == JoinSide.RIGHT
-        }
+    left_source_id: str
+    right_source_id: str
+    destination_id: str

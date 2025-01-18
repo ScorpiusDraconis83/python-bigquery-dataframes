@@ -14,7 +14,6 @@
 
 from datetime import datetime
 import typing
-from unittest import TestCase
 
 import pandas as pd
 import pyarrow as pa
@@ -24,7 +23,7 @@ import pytz
 import bigframes
 import bigframes.features
 from bigframes.ml import core
-import tests.system.utils
+from tests.system import utils
 
 
 def test_model_eval(
@@ -212,7 +211,7 @@ def test_pca_model_principal_components(penguins_bqml_pca_model: core.BqmlModel)
         .reset_index(drop=True)
     )
 
-    tests.system.utils.assert_pandas_df_equal_pca_components(
+    utils.assert_pandas_df_equal_pca_components(
         result,
         expected,
         check_exact=False,
@@ -234,7 +233,7 @@ def test_pca_model_principal_component_info(penguins_bqml_pca_model: core.BqmlMo
             "cumulative_explained_variance_ratio": [0.469357, 0.651283, 0.812383],
         },
     )
-    tests.system.utils.assert_pandas_df_equal(
+    utils.assert_pandas_df_equal(
         result,
         expected,
         check_exact=False,
@@ -255,6 +254,29 @@ def test_model_predict(penguins_bqml_linear_model: core.BqmlModel, new_penguins_
     )
     pd.testing.assert_frame_equal(
         predictions[["predicted_body_mass_g"]].sort_index(),
+        expected,
+        check_exact=False,
+        rtol=0.1,
+    )
+
+
+def test_model_predict_explain(
+    penguins_bqml_linear_model: core.BqmlModel, new_penguins_df
+):
+    options = {"top_k_features": 3}
+    predictions = penguins_bqml_linear_model.explain_predict(
+        new_penguins_df, options
+    ).to_pandas()
+    expected = pd.DataFrame(
+        {
+            "predicted_body_mass_g": [4030.1, 3280.8, 3177.9],
+            "approximation_error": [0.0, 0.0, 0.0],
+        },
+        dtype="Float64",
+        index=pd.Index([1633, 1672, 1690], name="tag_number", dtype="Int64"),
+    )
+    pd.testing.assert_frame_equal(
+        predictions[["predicted_body_mass_g", "approximation_error"]].sort_index(),
         expected,
         check_exact=False,
         rtol=0.1,
@@ -289,6 +311,64 @@ def test_model_predict_with_unnamed_index(
     )
 
 
+def test_model_predict_explain_with_unnamed_index(
+    penguins_bqml_linear_model: core.BqmlModel, new_penguins_df
+):
+    # This will result in an index that lacks a name, which the ML library will
+    # need to persist through the call to ML.PREDICT
+    new_penguins_df = new_penguins_df.reset_index()
+
+    options = {"top_k_features": 3}
+    # remove the middle tag number to ensure we're really keeping the unnamed index
+    new_penguins_df = typing.cast(
+        bigframes.dataframe.DataFrame,
+        new_penguins_df[new_penguins_df.tag_number != 1672],
+    )
+
+    predictions = penguins_bqml_linear_model.explain_predict(
+        new_penguins_df, options
+    ).to_pandas()
+
+    expected = pd.DataFrame(
+        {
+            "predicted_body_mass_g": [4030.1, 3177.9],
+            "approximation_error": [0.0, 0.0],
+        },
+        dtype="Float64",
+        index=pd.Index([0, 2], dtype="Int64"),
+    )
+    pd.testing.assert_frame_equal(
+        predictions[["predicted_body_mass_g", "approximation_error"]].sort_index(),
+        expected,
+        check_exact=False,
+        rtol=0.1,
+    )
+
+
+def test_model_detect_anomalies(
+    penguins_bqml_pca_model: core.BqmlModel, new_penguins_df
+):
+    options = {"contamination": 0.25}
+    anomalies = penguins_bqml_pca_model.detect_anomalies(
+        new_penguins_df, options
+    ).to_pandas()
+    expected = pd.DataFrame(
+        {
+            "is_anomaly": [True, True, True],
+            "mean_squared_error": [0.254188, 0.731243, 0.298889],
+        },
+        index=pd.Index([1633, 1672, 1690], name="tag_number", dtype="Int64"),
+    )
+    pd.testing.assert_frame_equal(
+        anomalies[["is_anomaly", "mean_squared_error"]].sort_index(),
+        expected,
+        check_exact=False,
+        check_dtype=False,
+        rtol=0.1,
+    )
+
+
+@pytest.mark.skip("b/353775058 BQML internal error")
 def test_remote_model_predict(
     bqml_linear_remote_model: core.BqmlModel, new_penguins_df
 ):
@@ -310,7 +390,7 @@ def test_remote_model_predict(
     )
 
 
-@pytest.mark.flaky(retries=2, delay=120)
+@pytest.mark.flaky(retries=2)
 def test_model_generate_text(
     bqml_palm2_text_generator_model: core.BqmlModel, llm_text_df
 ):
@@ -325,18 +405,9 @@ def test_model_generate_text(
         llm_text_df, options=options
     ).to_pandas()
 
-    TestCase().assertSequenceEqual(df.shape, (3, 4))
-    TestCase().assertSequenceEqual(
-        [
-            "ml_generate_text_llm_result",
-            "ml_generate_text_rai_result",
-            "ml_generate_text_status",
-            "prompt",
-        ],
-        df.columns.to_list(),
+    utils.check_pandas_df_schema_and_index(
+        df, columns=utils.ML_GENERATE_TEXT_OUTPUT, index=3, col_exact=False
     )
-    series = df["ml_generate_text_llm_result"]
-    assert all(series.str.len() > 20)
 
 
 def test_model_forecast(time_series_bqml_arima_plus_model: core.BqmlModel):
@@ -367,16 +438,25 @@ def test_model_forecast(time_series_bqml_arima_plus_model: core.BqmlModel):
     )
 
 
-def test_model_register(ephemera_penguins_bqml_linear_model):
+def test_model_register(ephemera_penguins_bqml_linear_model: core.BqmlModel):
     model = ephemera_penguins_bqml_linear_model
+
+    start_execution_count = model.session._metrics.execution_count
+
     model.register()
 
+    end_execution_count = model.session._metrics.execution_count
+    assert end_execution_count - start_execution_count == 1
+
+    assert model.model.model_id is not None
     model_name = "bigframes_" + model.model.model_id
     # Only registered model contains the field, and the field includes project/dataset. Here only check model_id.
     assert model_name in model.model.training_runs[-1]["vertexAiModelId"]
 
 
-def test_model_register_with_params(ephemera_penguins_bqml_linear_model):
+def test_model_register_with_params(
+    ephemera_penguins_bqml_linear_model: core.BqmlModel,
+):
     model_name = "bigframes_system_test_model"
     model = ephemera_penguins_bqml_linear_model
     model.register(model_name)

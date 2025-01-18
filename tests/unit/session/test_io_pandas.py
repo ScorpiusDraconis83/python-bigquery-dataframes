@@ -13,7 +13,9 @@
 # limitations under the License.
 
 import datetime
+import re
 from typing import Dict, Union
+import unittest.mock as mock
 
 import geopandas  # type: ignore
 import numpy
@@ -23,8 +25,12 @@ import pandas.testing
 import pyarrow  # type: ignore
 import pytest
 
+import bigframes.core.schema
 import bigframes.features
+import bigframes.pandas
 import bigframes.session._io.pandas
+
+from .. import resources
 
 _LIST_OF_SCALARS = [
     [1, 2, 3],
@@ -440,7 +446,13 @@ def test_arrow_to_pandas(
     dtypes: Dict,
     expected: pandas.DataFrame,
 ):
-    actual = bigframes.session._io.pandas.arrow_to_pandas(arrow_table, dtypes)
+    schema = bigframes.core.schema.ArraySchema(
+        tuple(
+            bigframes.core.schema.SchemaItem(name, dtype)
+            for name, dtype in dtypes.items()
+        )
+    )
+    actual = bigframes.session._io.pandas.arrow_to_pandas(arrow_table, schema)
     pandas.testing.assert_series_equal(actual.dtypes, expected.dtypes)
 
     # assert_frame_equal is converting to numpy internally, which causes some
@@ -473,5 +485,21 @@ def test_arrow_to_pandas(
 def test_arrow_to_pandas_wrong_size_dtypes(
     arrow_table: Union[pyarrow.Table, pyarrow.RecordBatch], dtypes: Dict
 ):
-    with pytest.raises(ValueError, match=f"Number of types {len(dtypes)}"):
-        bigframes.session._io.pandas.arrow_to_pandas(arrow_table, dtypes)
+    schema = bigframes.core.schema.ArraySchema(
+        tuple(
+            bigframes.core.schema.SchemaItem(name, dtype)
+            for name, dtype in dtypes.items()
+        )
+    )
+    with pytest.raises(ValueError, match=f"Number of types {len(schema)}"):
+        bigframes.session._io.pandas.arrow_to_pandas(arrow_table, schema)
+
+
+def test_read_pandas_with_bigframes_dataframe():
+    session = resources.create_bigquery_session()
+    df = mock.create_autospec(bigframes.pandas.DataFrame, instance=True)
+
+    with pytest.raises(
+        ValueError, match=re.escape("read_pandas() expects a pandas.DataFrame")
+    ):
+        session.read_pandas(df)

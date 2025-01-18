@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 import io
 import itertools
 import os
@@ -30,36 +31,51 @@ description = (
 # 'Development Status :: 3 - Alpha'
 # 'Development Status :: 4 - Beta'
 # 'Development Status :: 5 - Production/Stable'
-release_status = "Development Status :: 3 - Alpha"
+release_status = "Development Status :: 5 - Production/Stable"
 dependencies = [
+    # please keep these in sync with the minimum versions in testing/constraints-3.9.txt
     "cloudpickle >= 2.0.0",
     "fsspec >=2023.3.0",
     "gcsfs >=2023.3.0",
     "geopandas >=0.12.2",
-    "google-auth >2.14.1,<3.0dev",
-    "google-cloud-bigquery[bqstorage,pandas] >=3.10.0",
-    "google-cloud-functions >=1.10.1",
+    "google-auth >=2.15.0,<3.0dev",
+    "google-cloud-bigtable >=2.24.0",
+    "google-cloud-pubsub >=2.21.4",
+    "google-cloud-bigquery[bqstorage,pandas] >=3.18.0",
+    "google-cloud-functions >=1.12.0",
     "google-cloud-bigquery-connection >=1.12.0",
     "google-cloud-iam >=2.12.1",
     "google-cloud-resource-manager >=1.10.3",
     "google-cloud-storage >=2.0.0",
-    # TODO: Relax upper bound once we have fixed unit tests with 7.2.0.
-    "ibis-framework[bigquery] >=7.1.0,<7.2.0dev",
-    # TODO: Relax upper bound once we have fixed `system_prerelease` tests.
-    "pandas >=1.5.0,<2.1.4",
+    # Upper bound due to no windows build for 1.1.2
+    "jellyfish >=0.8.9,<1.1.2",
+    "numpy >=1.24.0",
+    "pandas >=1.5.3",
+    "pandas-gbq >=0.26.0",
+    "pyarrow >=10.0.1",
     "pydata-google-auth >=1.8.2",
     "requests >=2.27.1",
     "scikit-learn >=1.2.2",
     "sqlalchemy >=1.4,<3.0dev",
-    "tabulate >= 0.9",
+    "sqlglot >=23.6.3",
+    "tabulate >=0.9",
     "ipywidgets >=7.7.1",
-    "humanize >= 4.6.0",
+    "humanize >=4.6.0",
+    "matplotlib >=3.7.1",
+    # For vendored ibis-framework.
+    "atpublic>=2.3,<6",
+    "parsy>=2,<3",
+    "python-dateutil>=2.8.2,<3",
+    "pytz>=2022.7",
+    "toolz>=0.11,<2",
+    "typing-extensions>=4.5.0,<5",
+    "rich>=12.4.4,<14",
 ]
 extras = {
     # Optional test dependencies packages. If they're missed, may skip some tests.
-    "tests": [
-        "pandas-gbq >=0.19.0",
-    ],
+    "tests": [],
+    # used for local engine, which is only needed for unit tests at present.
+    "polars": ["polars >= 1.7.0"],
     # Packages required for basic development flow.
     "dev": ["pytest", "pytest-mock", "pre-commit", "nox", "google-cloud-testutils"],
 }
@@ -83,7 +99,11 @@ version_id = version["__version__"]
 packages = [
     package
     for package in setuptools.find_namespace_packages()
-    if package.startswith("bigframes") or package.startswith("third_party")
+    if package.startswith("bigframes")
+] + [
+    package
+    for package in setuptools.find_namespace_packages("third_party")
+    if package.startswith("bigframes_vendored")
 ]
 
 setuptools.setup(
@@ -104,12 +124,17 @@ setuptools.setup(
         "Programming Language :: Python :: 3.9",
         "Programming Language :: Python :: 3.10",
         "Programming Language :: Python :: 3.11",
+        "Programming Language :: Python :: 3.12",
         "Operating System :: OS Independent",
         "Topic :: Internet",
     ],
     install_requires=dependencies,
     extras_require=extras,
     platforms="Posix; MacOS X; Windows",
+    package_dir={
+        "bigframes": "bigframes",
+        "bigframes_vendored": "third_party/bigframes_vendored",
+    },
     packages=packages,
     python_requires=">=3.9",
     include_package_data=True,

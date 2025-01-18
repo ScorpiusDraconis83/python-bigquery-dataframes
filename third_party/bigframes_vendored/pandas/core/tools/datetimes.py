@@ -1,14 +1,13 @@
 # Contains code from https://github.com/pandas-dev/pandas/blob/main/pandas/core/tools/datetimes.py
 
 from datetime import datetime
-from typing import Iterable, Mapping, Union
+from typing import List, Mapping, Tuple, Union
 
 import pandas as pd
 
 from bigframes import constants, series
 
-local_scalars = Union[int, float, str, datetime]
-local_iterables = Union[Iterable, pd.Series, pd.DataFrame, Mapping]
+local_iterables = Union[List, Tuple, pd.Series, pd.DataFrame, Mapping]
 
 
 def to_datetime(
@@ -29,7 +28,7 @@ def to_datetime(
     .. note::
         The format strings for specifying datetime representations in BigQuery and pandas
         are not completely identical. Ensure that the format string provided is compatible
-        with BigQuery.
+        with BigQuery (https://cloud.google.com/bigquery/docs/reference/standard-sql/format-elements#format_elements_date_time).
 
     **Examples:**
 
@@ -48,7 +47,7 @@ def to_datetime(
         >>> bpd.to_datetime(list_str, format="%m-%d-%Y %H:%M", utc=True)
         0    2021-01-31 14:30:00+00:00
         1    2021-02-28 15:45:00+00:00
-        Name: 0, dtype: timestamp[us, tz=UTC][pyarrow]
+        dtype: timestamp[us, tz=UTC][pyarrow]
 
     Converting a Series of Strings with Timezone Information:
 
@@ -72,6 +71,7 @@ def to_datetime(
             float number.
 
     Returns:
-        Timestamp, datetime.datetime or bigframes.series.Series: Return type depends on input.
+        Union[pandas.Timestamp, datetime.datetime or bigframes.pandas.Series]:
+            Return type depends on input.
     """
     raise NotImplementedError(constants.ABSTRACT_METHOD_ERROR_MESSAGE)

@@ -11,17 +11,24 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import functools
 import re
 import typing
 from typing import Hashable, Iterable, List
+import warnings
 
+import bigframes_vendored.pandas.io.common as vendored_pandas_io_common
 import pandas as pd
 import typing_extensions
 
-import third_party.bigframes_vendored.pandas.io.common as vendored_pandas_io_common
+import bigframes.exceptions as bfe
 
 UNNAMED_COLUMN_ID = "bigframes_unnamed_column"
 UNNAMED_INDEX_ID = "bigframes_unnamed_index"
+
+
+def is_gcs_path(value) -> typing_extensions.TypeGuard[str]:
+    return isinstance(value, str) and value.startswith("gs://")
 
 
 def get_axis_number(axis: typing.Union[str, int]) -> typing.Literal[0, 1]:
@@ -71,7 +78,9 @@ def split_index(
 
 
 def get_standardized_ids(
-    col_labels: Iterable[Hashable], idx_labels: Iterable[Hashable] = ()
+    col_labels: Iterable[Hashable],
+    idx_labels: Iterable[Hashable] = (),
+    strict: bool = False,
 ) -> tuple[list[str], list[str]]:
     """Get stardardized column ids as column_ids_list, index_ids_list.
     The standardized_column_id must be valid BQ SQL schema column names, can only be string type and unique.
@@ -85,11 +94,15 @@ def get_standardized_ids(
         Tuple of (standardized_column_ids, standardized_index_ids)
     """
     col_ids = [
-        UNNAMED_COLUMN_ID if col_label is None else label_to_identifier(col_label)
+        UNNAMED_COLUMN_ID
+        if col_label is None
+        else label_to_identifier(col_label, strict=strict)
         for col_label in col_labels
     ]
     idx_ids = [
-        UNNAMED_INDEX_ID if idx_label is None else label_to_identifier(idx_label)
+        UNNAMED_INDEX_ID
+        if idx_label is None
+        else label_to_identifier(idx_label, strict=strict)
         for idx_label in idx_labels
     ]
 
@@ -107,8 +120,9 @@ def label_to_identifier(label: typing.Hashable, strict: bool = False) -> str:
     """
     # Column values will be loaded as null if the column name has spaces.
     # https://github.com/googleapis/python-bigquery/issues/1566
-    identifier = str(label).replace(" ", "_")
+    identifier = str(label)
     if strict:
+        identifier = str(label).replace(" ", "_")
         identifier = re.sub(r"[^a-zA-Z0-9_]", "", identifier)
         if not identifier:
             identifier = "id"
@@ -154,3 +168,19 @@ def merge_column_labels(
             result_labels.append(col_label)
 
     return pd.Index(result_labels)
+
+
+def preview(*, name: str):
+    """Decorate to warn of a preview API."""
+
+    def decorator(func):
+        msg = f"{name} is in preview. Its behavior may change in future versions."
+
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            warnings.warn(msg, category=bfe.PreviewWarning)
+            return func(*args, **kwargs)
+
+        return wrapper
+
+    return decorator

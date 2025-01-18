@@ -35,6 +35,14 @@ String handling
     :inherited-members:
     :undoc-members:
 
+List handling
+^^^^^^^^^^^^^
+
+.. automodule:: bigframes.operations.lists
+    :members:
+    :inherited-members:
+    :undoc-members:
+
 Struct handling
 ^^^^^^^^^^^^^^^
 
@@ -42,3 +50,12 @@ Struct handling
     :members:
     :inherited-members:
     :undoc-members:
+
+Plotting handling
+^^^^^^^^^^^^^^^^^
+
+.. automodule:: bigframes.operations.plotting
+    :members:
+    :inherited-members:
+    :undoc-members:
+    :noindex:

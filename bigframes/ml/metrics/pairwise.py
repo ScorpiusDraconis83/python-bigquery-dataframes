@@ -15,20 +15,68 @@
 import inspect
 from typing import Union
 
-from bigframes.ml import core, utils
+import bigframes_vendored.sklearn.metrics.pairwise as vendored_metrics_pairwise
+
+from bigframes.ml import utils
+import bigframes.operations as ops
 import bigframes.pandas as bpd
-import third_party.bigframes_vendored.sklearn.metrics.pairwise as vendored_metrics_pairwise
 
 
-def cosine_similarity(
+def paired_cosine_distances(
     X: Union[bpd.DataFrame, bpd.Series], Y: Union[bpd.DataFrame, bpd.Series]
 ) -> bpd.DataFrame:
-    X, Y = utils.convert_to_dataframe(X, Y)
-    if len(X.columns) != 1 or len(Y.columns) != 1:
-        raise ValueError("Inputs X and Y can only contain 1 column.")
+    X, Y = utils.batch_convert_to_series(X, Y)
+    joined_block, _ = X._block.join(Y._block, how="outer")
 
-    base_bqml = core.BaseBqml(session=X._session)
-    return base_bqml.distance(X, Y, type="COSINE", name="cosine_similarity")
+    result_block, _ = joined_block.project_expr(
+        ops.cosine_distance_op.as_expr(
+            joined_block.value_columns[0], joined_block.value_columns[1]
+        ),
+        label="cosine_distance",
+    )
+    return bpd.DataFrame(result_block)
 
 
-cosine_similarity.__doc__ = inspect.getdoc(vendored_metrics_pairwise.cosine_similarity)
+paired_cosine_distances.__doc__ = inspect.getdoc(
+    vendored_metrics_pairwise.paired_cosine_distances
+)
+
+
+def paired_manhattan_distance(
+    X: Union[bpd.DataFrame, bpd.Series], Y: Union[bpd.DataFrame, bpd.Series]
+) -> bpd.DataFrame:
+    X, Y = utils.batch_convert_to_series(X, Y)
+    joined_block, _ = X._block.join(Y._block, how="outer")
+
+    result_block, _ = joined_block.project_expr(
+        ops.manhattan_distance_op.as_expr(
+            joined_block.value_columns[0], joined_block.value_columns[1]
+        ),
+        label="manhattan_distance",
+    )
+    return bpd.DataFrame(result_block)
+
+
+paired_manhattan_distance.__doc__ = inspect.getdoc(
+    vendored_metrics_pairwise.paired_manhattan_distance
+)
+
+
+def paired_euclidean_distances(
+    X: Union[bpd.DataFrame, bpd.Series], Y: Union[bpd.DataFrame, bpd.Series]
+) -> bpd.DataFrame:
+    X, Y = utils.batch_convert_to_series(X, Y)
+    joined_block, _ = X._block.join(Y._block, how="outer")
+
+    result_block, _ = joined_block.project_expr(
+        ops.euclidean_distance_op.as_expr(
+            joined_block.value_columns[0], joined_block.value_columns[1]
+        ),
+        label="euclidean_distance",
+    )
+    return bpd.DataFrame(result_block)
+
+
+paired_euclidean_distances.__doc__ = inspect.getdoc(
+    vendored_metrics_pairwise.paired_euclidean_distances
+)

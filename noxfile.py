@@ -16,12 +16,13 @@
 
 from __future__ import absolute_import
 
-from multiprocessing import Process
+import argparse
+import multiprocessing
 import os
 import pathlib
-from pathlib import Path
 import re
 import shutil
+import time
 from typing import Dict, List
 import warnings
 
@@ -35,14 +36,22 @@ ISORT_VERSION = "isort==5.12.0"
 # https://github.com/str0zzapreti/pytest-retry/issues/32
 PYTEST_VERSION = "pytest<8.0.0dev"
 SPHINX_VERSION = "sphinx==4.5.0"
-LINT_PATHS = ["docs", "bigframes", "tests", "third_party", "noxfile.py", "setup.py"]
+LINT_PATHS = [
+    "docs",
+    "bigframes",
+    "tests",
+    "third_party",
+    "noxfile.py",
+    "setup.py",
+]
 
 DEFAULT_PYTHON_VERSION = "3.10"
 
-UNIT_TEST_PYTHON_VERSIONS = ["3.9", "3.10", "3.11"]
+UNIT_TEST_PYTHON_VERSIONS = ["3.9", "3.10", "3.11", "3.12"]
 UNIT_TEST_STANDARD_DEPENDENCIES = [
     "mock",
     "asyncmock",
+    "freezegun",
     PYTEST_VERSION,
     "pytest-cov",
     "pytest-asyncio",
@@ -52,9 +61,11 @@ UNIT_TEST_EXTERNAL_DEPENDENCIES: List[str] = []
 UNIT_TEST_LOCAL_DEPENDENCIES: List[str] = []
 UNIT_TEST_DEPENDENCIES: List[str] = []
 UNIT_TEST_EXTRAS: List[str] = []
-UNIT_TEST_EXTRAS_BY_PYTHON: Dict[str, List[str]] = {}
+UNIT_TEST_EXTRAS_BY_PYTHON: Dict[str, List[str]] = {"3.12": ["polars"]}
 
-SYSTEM_TEST_PYTHON_VERSIONS = ["3.9", "3.11"]
+# There are 4 different ibis-framework 9.x versions we want to test against.
+# 3.10 is needed for Windows tests.
+SYSTEM_TEST_PYTHON_VERSIONS = ["3.9", "3.10", "3.11", "3.12"]
 SYSTEM_TEST_STANDARD_DEPENDENCIES = [
     "jinja2",
     "mock",
@@ -76,6 +87,8 @@ SYSTEM_TEST_DEPENDENCIES: List[str] = []
 SYSTEM_TEST_EXTRAS: List[str] = ["tests"]
 SYSTEM_TEST_EXTRAS_BY_PYTHON: Dict[str, List[str]] = {}
 
+LOGGING_NAME_ENV_VAR = "BIGFRAMES_PERFORMANCE_LOG_NAME"
+
 CURRENT_DIRECTORY = pathlib.Path(__file__).parent.absolute()
 
 # Sessions are executed in the order so putting the smaller sessions
@@ -90,9 +103,10 @@ nox.options.sessions = [
     "docfx",
     "unit",
     "unit_noextras",
-    "system",
-    "doctest",
+    "system-3.9",
+    "system-3.12",
     "cover",
+    "cleanup",
 ]
 
 # Error if a python version is missing
@@ -112,8 +126,7 @@ def lint(session):
         "--check",
         *LINT_PATHS,
     )
-    # TODO(tswast): lint all LINT_PATHS
-    session.run("flake8", "bigframes", "tests")
+    session.run("flake8", *LINT_PATHS)
 
 
 @nox.session(python=DEFAULT_PYTHON_VERSION)
@@ -157,11 +170,11 @@ def install_unittest_dependencies(session, install_test_extra, *constraints):
     session.install(*standard_deps, *constraints)
 
     if UNIT_TEST_EXTERNAL_DEPENDENCIES:
-        warnings.warn(
+        msg = (
             "'unit_test_external_dependencies' is deprecated. Instead, please "
             "use 'unit_test_dependencies' or 'unit_test_local_dependencies'.",
-            DeprecationWarning,
         )
+        warnings.warn(msg, DeprecationWarning)
         session.install(*UNIT_TEST_EXTERNAL_DEPENDENCIES, *constraints)
 
     if UNIT_TEST_LOCAL_DEPENDENCIES:
@@ -188,6 +201,7 @@ def run_unit(session, install_test_extra):
     install_unittest_dependencies(session, install_test_extra, "-c", constraints_path)
 
     # Run py.test against the unit tests.
+    scripts_path = "scripts"
     tests_path = os.path.join("tests", "unit")
     third_party_tests_path = os.path.join("third_party", "bigframes_vendored")
     session.run(
@@ -202,6 +216,7 @@ def run_unit(session, install_test_extra):
         "--cov-fail-under=0",
         tests_path,
         third_party_tests_path,
+        scripts_path,
         *session.posargs,
     )
 
@@ -219,7 +234,10 @@ def unit_noextras(session):
 @nox.session(python=DEFAULT_PYTHON_VERSION)
 def mypy(session):
     """Run type checks with mypy."""
-    session.install("-e", ".")
+    # Editable mode is not compatible with mypy when there are multiple
+    # package directories. See:
+    # https://github.com/python/mypy/issues/10564#issuecomment-851687749
+    session.install(".")
 
     # Just install the dependencies' type info directly, since "mypy --install-types"
     # might require an additional pass.
@@ -233,6 +251,7 @@ def mypy(session):
                 "types-requests",
                 "types-setuptools",
                 "types-tabulate",
+                "polars",
             ]
         )
         | set(SYSTEM_TEST_STANDARD_DEPENDENCIES)
@@ -246,6 +265,7 @@ def mypy(session):
         "bigframes",
         os.path.join("tests", "system"),
         os.path.join("tests", "unit"),
+        "--check-untyped-defs",
         "--explicit-package-bases",
         '--exclude="^third_party"',
     )
@@ -290,6 +310,8 @@ def run_system(
     install_test_extra=True,
     print_duration=False,
     extra_pytest_options=(),
+    timeout_seconds=900,
+    num_workers=20,
 ):
     """Run the system test suite."""
     constraints_path = str(
@@ -309,9 +331,9 @@ def run_system(
     pytest_cmd = [
         "py.test",
         "--quiet",
-        "-n=20",
+        f"-n={num_workers}",
         # Any individual test taking longer than 15 mins will be terminated.
-        "--timeout=900",
+        f"--timeout={timeout_seconds}",
         # Log 20 slowest tests
         "--durations=20",
         f"--junitxml={prefix_name}_{session.python}_sponge_log.xml",
@@ -337,8 +359,8 @@ def run_system(
     pytest_cmd.extend(extra_pytest_options)
     session.run(
         *pytest_cmd,
-        test_folder,
         *session.posargs,
+        test_folder,
     )
 
 
@@ -370,9 +392,17 @@ def doctest(session: nox.sessions.Session):
     run_system(
         session=session,
         prefix_name="doctest",
-        extra_pytest_options=("--doctest-modules", "third_party"),
+        extra_pytest_options=(
+            "--doctest-modules",
+            "third_party",
+            "--ignore",
+            "third_party/bigframes_vendored/ibis",
+            "--ignore",
+            "bigframes/core/compile/polars",
+        ),
         test_folder="bigframes",
         check_cov=True,
+        num_workers=5,
     )
 
 
@@ -387,23 +417,15 @@ def e2e(session: nox.sessions.Session):
     )
 
 
-@nox.session(python=SYSTEM_TEST_PYTHON_VERSIONS)
-def samples(session):
-    """Run the samples test suite."""
-
-    constraints_path = str(
-        CURRENT_DIRECTORY / "testing" / f"constraints-{session.python}.txt"
-    )
-
-    # TODO(swast): Use `requirements.txt` files from the samples directories to
-    # test samples.
-    install_test_extra = True
-    install_systemtest_dependencies(session, install_test_extra, "-c", constraints_path)
-
-    session.run(
-        "py.test",
-        "samples",
-        *session.posargs,
+@nox.session(python=SYSTEM_TEST_PYTHON_VERSIONS[-1])
+def load(session: nox.sessions.Session):
+    """Run the very large tests in system test suite."""
+    run_system(
+        session=session,
+        prefix_name="load",
+        test_folder=os.path.join("tests", "system", "load"),
+        print_duration=True,
+        timeout_seconds=60 * 60 * 12,
     )
 
 
@@ -415,16 +437,25 @@ def cover(session):
     (including system test runs), and then erases coverage data.
     """
     session.install("coverage", "pytest-cov")
-    session.run("coverage", "report", "--show-missing", "--fail-under=90")
+
+    # Create a coverage report that includes only the product code.
+    session.run(
+        "coverage",
+        "report",
+        "--include=bigframes/*",
+        "--show-missing",
+        "--fail-under=86",
+    )
 
     # Make sure there is no dead code in our test directories.
-    # TODO(swast): Cleanup dead code in the system tests directory.
     session.run(
         "coverage",
         "report",
         "--show-missing",
         "--include=tests/unit/*",
-        "--fail-under=100",
+        "--include=tests/system/small/*",
+        # TODO(b/353775058) resume coverage to 100 when the issue is fixed.
+        "--fail-under=99",
     )
 
     session.run("coverage", "erase")
@@ -451,6 +482,12 @@ def docs(session):
     )
 
     shutil.rmtree(os.path.join("docs", "_build"), ignore_errors=True)
+
+    session.run(
+        "python",
+        "scripts/publish_api_coverage.py",
+        "docs",
+    )
     session.run(
         "sphinx-build",
         "-W",  # warnings as errors
@@ -483,10 +520,16 @@ def docfx(session):
         SPHINX_VERSION,
         "alabaster",
         "recommonmark",
-        "gcp-sphinx-docfx-yaml",
+        "gcp-sphinx-docfx-yaml==3.0.1",
     )
 
     shutil.rmtree(os.path.join("docs", "_build"), ignore_errors=True)
+
+    session.run(
+        "python",
+        "scripts/publish_api_coverage.py",
+        "docs",
+    )
     session.run(
         "sphinx-build",
         "-T",  # show full traceback on exception
@@ -512,7 +555,7 @@ def docfx(session):
     )
 
 
-def prerelease(session: nox.sessions.Session, tests_path):
+def prerelease(session: nox.sessions.Session, tests_path, extra_pytest_options=()):
     constraints_path = str(
         CURRENT_DIRECTORY / "testing" / f"constraints-{session.python}.txt"
     )
@@ -535,40 +578,27 @@ def prerelease(session: nox.sessions.Session, tests_path):
     already_installed.add("pyarrow")
 
     session.install(
-        "--extra-index-url",
-        "https://pypi.anaconda.org/scipy-wheels-nightly/simple",
         "--prefer-binary",
         "--pre",
         "--upgrade",
-        # TODO(shobs): Remove excluding version 2.1.4 after
-        # https://github.com/pandas-dev/pandas/issues/56463 is resolved.
-        #
-        # TODO(shobs): Remove excluding version 2.2.0rc0 after
-        # https://github.com/pandas-dev/pandas/issues/56646 and
-        # https://github.com/pandas-dev/pandas/issues/56651 are resolved.
-        #
-        # TODO(shobs): Remove excluding version 2.2.0 after
-        # https://github.com/googleapis/python-bigquery-dataframes/issues/341
-        # https://github.com/googleapis/python-bigquery-dataframes/issues/337
-        # are resolved
-        "pandas!=2.1.4, !=2.2.0rc0, !=2.2.0",
+        # We exclude each version individually so that we can continue to test
+        # some prerelease packages. See:
+        # https://github.com/googleapis/python-bigquery-dataframes/pull/268#discussion_r1423205172
+        # "pandas!=2.1.4, !=2.2.0rc0, !=2.2.0, !=2.2.1",
+        "pandas",
     )
     already_installed.add("pandas")
 
-    # Ibis has introduced breaking changes. Let's exclude ibis head
-    # from prerelease install list for now. We should enable the head back
-    # once bigframes supports the version at HEAD.
-    # session.install(
-    #     "--upgrade",
-    #     "-e",  # Use -e so that py.typed file is included.
-    #     "git+https://github.com/ibis-project/ibis.git@7.x.x#egg=ibis-framework",
-    # )
+    # Try to avoid a cap on our SQLGlot so that bigframes
+    # can be integrated with SQLMesh. See:
+    # https://github.com/googleapis/python-bigquery-dataframes/issues/942
+    # If SQLGlot introduces something that breaks us, lets file an issue
+    # upstream and/or make sure we fix bigframes to work with it.
     session.install(
         "--upgrade",
-        # "--pre",
-        "ibis-framework>=7.1.0,<7.2.0dev",
+        "git+https://github.com/tobymao/sqlglot.git#egg=sqlglot",
     )
-    already_installed.add("ibis-framework")
+    already_installed.add("sqlglot")
 
     # Workaround https://github.com/googleapis/python-db-dtypes-pandas/issues/178
     session.install("--no-deps", "db-dtypes")
@@ -586,9 +616,10 @@ def prerelease(session: nox.sessions.Session, tests_path):
         "git+https://github.com/googleapis/python-bigquery-storage.git#egg=google-cloud-bigquery-storage",
     )
     already_installed.add("google-cloud-bigquery-storage")
-
-    # Workaround to install pandas-gbq >=0.15.0, which is required by test only.
-    session.install("--no-deps", "pandas-gbq")
+    session.install(
+        "--upgrade",
+        "git+https://github.com/googleapis/python-bigquery-pandas.git#egg=pandas-gbq",
+    )
     already_installed.add("pandas-gbq")
 
     session.install(
@@ -640,6 +671,7 @@ def prerelease(session: nox.sessions.Session, tests_path):
         "--cov-report=term-missing",
         "--cov-fail-under=0",
         tests_path,
+        *extra_pytest_options,
         *session.posargs,
     )
 
@@ -653,13 +685,30 @@ def unit_prerelease(session: nox.sessions.Session):
 @nox.session(python=SYSTEM_TEST_PYTHON_VERSIONS[-1])
 def system_prerelease(session: nox.sessions.Session):
     """Run the system test suite with prerelease dependencies."""
-    prerelease(session, os.path.join("tests", "system", "small"))
+    small_tests_dir = os.path.join("tests", "system", "small")
+
+    # Let's exclude remote function tests from the prerelease tests, since the
+    # some of the package dependencies propagate to the cloud run functions'
+    # requirements.txt, and the prerelease package versions may not be available
+    # in the standard pip install.
+    # This would mean that we will only rely on the standard remote function
+    # tests.
+    small_remote_function_tests = os.path.join(
+        small_tests_dir, "test_remote_function.py"
+    )
+    assert os.path.exists(small_remote_function_tests)
+
+    prerelease(
+        session,
+        os.path.join("tests", "system", "small"),
+        (f"--ignore={small_remote_function_tests}",),
+    )
 
 
 @nox.session(python=SYSTEM_TEST_PYTHON_VERSIONS)
 def notebook(session: nox.Session):
-    GOOGLE_CLOUD_PROJECT = os.getenv("GOOGLE_CLOUD_PROJECT")
-    if not GOOGLE_CLOUD_PROJECT:
+    google_cloud_project = os.getenv("GOOGLE_CLOUD_PROJECT")
+    if not google_cloud_project:
         session.error(
             "Set GOOGLE_CLOUD_PROJECT environment variable to run notebook session."
         )
@@ -675,7 +724,7 @@ def notebook(session: nox.Session):
         "seaborn",
     )
 
-    notebooks_list = list(Path("notebooks/").glob("*/*.ipynb"))
+    notebooks_list = list(pathlib.Path("notebooks/").glob("*/*.ipynb"))
 
     denylist = [
         # Regionalized testing is manually added later.
@@ -687,21 +736,30 @@ def notebook(session: nox.Session):
         # With the notebooks_fill_params.py script, we are able to find and
         # replace the PROJECT_ID parameter, but not the others.
         #
-        # TODO(ashleyxu): Test these notebooks by replacing parameters with
+        # TODO(b/357904266): Test these notebooks by replacing parameters with
         # appropriate values and omitting cleanup logic that may break
         # our test infrastructure.
         "notebooks/getting_started/ml_fundamentals_bq_dataframes.ipynb",  # Needs DATASET.
-        "notebooks/regression/bq_dataframes_ml_linear_regression.ipynb",  # Needs DATASET_ID.
+        "notebooks/ml/bq_dataframes_ml_linear_regression.ipynb",  # Needs DATASET_ID.
         "notebooks/generative_ai/bq_dataframes_ml_drug_name_generation.ipynb",  # Needs CONNECTION.
-        # TODO(swast): investigate why we get 404 errors, even though
+        # TODO(b/332737009): investigate why we get 404 errors, even though
         # bq_dataframes_llm_code_generation creates a bucket in the sample.
         "notebooks/generative_ai/bq_dataframes_llm_code_generation.ipynb",  # Needs BUCKET_URI.
+        "notebooks/generative_ai/sentiment_analysis.ipynb",  # Too slow
+        "notebooks/generative_ai/bq_dataframes_llm_gemini_2.ipynb",  # Gemini 2.0 backend hasn't ready in prod.
+        # TODO(b/366290533): to protect BQML quota
+        "notebooks/generative_ai/bq_dataframes_llm_claude3_museum_art.ipynb",
         "notebooks/vertex_sdk/sdk2_bigframes_pytorch.ipynb",  # Needs BUCKET_URI.
         "notebooks/vertex_sdk/sdk2_bigframes_sklearn.ipynb",  # Needs BUCKET_URI.
         "notebooks/vertex_sdk/sdk2_bigframes_tensorflow.ipynb",  # Needs BUCKET_URI.
         # The experimental notebooks imagine features that don't yet
         # exist or only exist as temporary prototypes.
         "notebooks/experimental/longer_ml_demo.ipynb",
+        "notebooks/experimental/semantic_operators.ipynb",
+        # The notebooks that are added for more use cases, such as backing a
+        # blog post, which may take longer to execute and need not be
+        # continuously tested.
+        "notebooks/apps/synthetic_data_generation.ipynb",
     ]
 
     # Convert each Path notebook object to a string using a list comprehension.
@@ -732,16 +790,11 @@ def notebook(session: nox.Session):
     for nb in notebooks + list(notebooks_reg):
         assert os.path.exists(nb), nb
 
-    # TODO(shobs): For some reason --retries arg masks exceptions occurred in
-    # notebook failures, and shows unhelpful INTERNALERROR. Investigate that
-    # and enable retries if we can find a way to surface the real exception
-    # bacause the notebook is running against real GCP and something may fail
-    # due to transient issues.
-    pytest_command = [
-        "py.test",
-        "--nbmake",
-        "--nbmake-timeout=900",  # 15 minutes
-    ]
+    # Determine whether to enable multi-process mode based on the environment
+    # variable. If BENCHMARK_AND_PUBLISH is "true", it indicates we're running
+    # a benchmark, so we disable multi-process mode. If BENCHMARK_AND_PUBLISH
+    # is "false", we enable multi-process mode for faster execution.
+    multi_process_mode = os.getenv("BENCHMARK_AND_PUBLISH", "false") == "false"
 
     try:
         # Populate notebook parameters and make a backup so that the notebooks
@@ -752,13 +805,51 @@ def notebook(session: nox.Session):
             *notebooks,
         )
 
-        # Run self-contained notebooks in single session.run
-        # achieve parallelization via -n
-        session.run(
-            *pytest_command,
-            "-nauto",
-            *notebooks,
-        )
+        processes = []
+        for notebook in notebooks:
+            args = (
+                "python",
+                "scripts/run_and_publish_benchmark.py",
+                "--notebook",
+                f"--benchmark-path={notebook}",
+            )
+            if multi_process_mode:
+                process = multiprocessing.Process(
+                    target=session.run,
+                    args=args,
+                )
+                process.start()
+                processes.append(process)
+                # Adding a small delay between starting each
+                # process to avoid potential race conditions。
+                time.sleep(1)
+            else:
+                session.run(*args)
+
+        for notebook, regions in notebooks_reg.items():
+            for region in regions:
+                region_args = (
+                    "python",
+                    "scripts/run_and_publish_benchmark.py",
+                    "--notebook",
+                    f"--benchmark-path={notebook}",
+                    f"--region={region}",
+                )
+                if multi_process_mode:
+                    process = multiprocessing.Process(
+                        target=session.run,
+                        args=region_args,
+                    )
+                    process.start()
+                    processes.append(process)
+                    # Adding a small delay between starting each
+                    # process to avoid potential race conditions。
+                    time.sleep(1)
+                else:
+                    session.run(*region_args)
+
+        for process in processes:
+            process.join()
     finally:
         # Prevent our notebook changes from getting checked in to git
         # accidentally.
@@ -767,22 +858,83 @@ def notebook(session: nox.Session):
             CURRENT_DIRECTORY / "scripts" / "notebooks_restore_from_backup.py",
             *notebooks,
         )
+        session.run(
+            "python",
+            "scripts/run_and_publish_benchmark.py",
+            "--notebook",
+            "--publish-benchmarks=notebooks/",
+        )
 
-    # Run regionalized notebooks in parallel session.run's, since each notebook
-    # takes a different region via env param.
-    processes = []
-    for notebook, regions in notebooks_reg.items():
-        for region in regions:
-            process = Process(
-                target=session.run,
-                args=(*pytest_command, notebook),
-                kwargs={"env": {"BIGQUERY_LOCATION": region}},
+
+@nox.session(python=DEFAULT_PYTHON_VERSION)
+def benchmark(session: nox.Session):
+    session.install("-e", ".[all]")
+    base_path = os.path.join("tests", "benchmark")
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "-i",
+        "--iterations",
+        type=int,
+        default=1,
+        help="Number of iterations to run each benchmark.",
+    )
+    parser.add_argument(
+        "-o",
+        "--output-csv",
+        nargs="?",
+        const=True,
+        default=False,
+        help=(
+            "Determines whether to output results to a CSV file. If no location is provided, "
+            "a temporary location is automatically generated."
+        ),
+    )
+    parser.add_argument(
+        "-b",
+        "--benchmark-filter",
+        nargs="+",
+        help=(
+            "List of file or directory names to include in the benchmarks. If not provided, "
+            "all benchmarks are run."
+        ),
+    )
+
+    args = parser.parse_args(session.posargs)
+
+    benchmark_script_list: List[pathlib.Path] = []
+    if args.benchmark_filter:
+        for filter_item in args.benchmark_filter:
+            full_path = os.path.join(base_path, filter_item)
+            if os.path.isdir(full_path):
+                benchmark_script_list.extend(pathlib.Path(full_path).rglob("*.py"))
+            elif os.path.isfile(full_path) and full_path.endswith(".py"):
+                benchmark_script_list.append(pathlib.Path(full_path))
+            else:
+                raise ValueError(
+                    f"Item {filter_item} does not match any valid file or directory"
+                )
+    else:
+        benchmark_script_list = list(pathlib.Path(base_path).rglob("*.py"))
+
+    try:
+        for benchmark in benchmark_script_list:
+            if benchmark.name in ("__init__.py", "utils.py"):
+                continue
+            session.run(
+                "python",
+                "scripts/run_and_publish_benchmark.py",
+                f"--benchmark-path={benchmark}",
+                f"--iterations={args.iterations}",
             )
-            process.start()
-            processes.append(process)
-
-    for process in processes:
-        process.join()
+    finally:
+        session.run(
+            "python",
+            "scripts/run_and_publish_benchmark.py",
+            f"--publish-benchmarks={base_path}",
+            f"--iterations={args.iterations}",
+            f"--output-csv={args.output_csv}",
+        )
 
 
 @nox.session(python="3.10")
@@ -797,3 +949,30 @@ def release_dry_run(session):
     ):
         env["PROJECT_ROOT"] = "."
     session.run(".kokoro/release-nightly.sh", "--dry-run", env=env)
+
+
+@nox.session(python=DEFAULT_PYTHON_VERSION)
+def cleanup(session):
+    """Clean up stale and/or temporary resources in the test project."""
+    google_cloud_project = os.getenv("GOOGLE_CLOUD_PROJECT")
+    cleanup_options = []
+    if google_cloud_project:
+        cleanup_options.append(f"--project-id={google_cloud_project}")
+
+    # Cleanup a few stale (more than 12 hours old) temporary cloud run
+    # functions created by bigframems. This will help keeping the test GCP
+    # project within the "Number of functions" quota
+    # https://cloud.google.com/functions/quotas#resource_limits
+    recency_cutoff_hours = 12
+    cleanup_count_per_location = 20
+    cleanup_options.extend(
+        [
+            f"--recency-cutoff={recency_cutoff_hours}",
+            "cleanup",
+            f"--number={cleanup_count_per_location}",
+        ]
+    )
+
+    session.install("-e", ".")
+
+    session.run("python", "scripts/manage_cloud_functions.py", *cleanup_options)

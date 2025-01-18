@@ -16,14 +16,16 @@ from typing import Tuple
 
 import google.api_core.exceptions
 import pandas as pd
+import pandas.testing
 import pyarrow as pa
 import pytest
 
-from tests.system.utils import assert_pandas_df_equal, convert_pandas_dtypes
+from tests.system import utils
 
 try:
     import pandas_gbq  # type: ignore
-except ImportError:
+except ImportError:  # pragma: NO COVER
+    # TODO(b/332758806): Run system tests without "extras"
     pandas_gbq = None
 
 import typing
@@ -32,6 +34,163 @@ import bigframes
 import bigframes.dataframe
 import bigframes.features
 import bigframes.pandas as bpd
+
+
+def test_sql_executes(scalars_df_default_index, bigquery_client):
+    """Test that DataFrame.sql returns executable SQL.
+
+    DF.sql is used in public documentation such as
+    https://cloud.google.com/blog/products/data-analytics/using-bigquery-dataframes-with-carto-geospatial-tools
+    as a way to pass a DataFrame on to carto without executing the SQL
+    immediately.
+
+    Make sure that this SQL can be run outside of BigQuery DataFrames (assuming
+    similar credentials / access to the referenced tables).
+    """
+    # Do some operations to make for more complex SQL.
+    df = (
+        scalars_df_default_index.drop(columns=["geography_col"])
+        .groupby("string_col")
+        .max()
+    )
+    df.index.name = None  # Don't include unnamed indexes.
+    query = df.sql
+
+    bf_result = df.to_pandas().sort_values("rowindex").reset_index(drop=True)
+    bq_result = (
+        bigquery_client.query_and_wait(query)
+        .to_dataframe()
+        .sort_values("rowindex")
+        .reset_index(drop=True)
+    )
+    pandas.testing.assert_frame_equal(bf_result, bq_result, check_dtype=False)
+
+
+def test_sql_executes_and_includes_named_index(
+    scalars_df_default_index, bigquery_client
+):
+    """Test that DataFrame.sql returns executable SQL.
+
+    DF.sql is used in public documentation such as
+    https://cloud.google.com/blog/products/data-analytics/using-bigquery-dataframes-with-carto-geospatial-tools
+    as a way to pass a DataFrame on to carto without executing the SQL
+    immediately.
+
+    Make sure that this SQL can be run outside of BigQuery DataFrames (assuming
+    similar credentials / access to the referenced tables).
+    """
+    # Do some operations to make for more complex SQL.
+    df = (
+        scalars_df_default_index.drop(columns=["geography_col"])
+        .groupby("string_col")
+        .max()
+    )
+    query = df.sql
+
+    bf_result = df.to_pandas().sort_values("rowindex")
+    bq_result = (
+        bigquery_client.query_and_wait(query)
+        .to_dataframe()
+        .set_index("string_col")
+        .sort_values("rowindex")
+    )
+    pandas.testing.assert_frame_equal(
+        bf_result, bq_result, check_dtype=False, check_index_type=False
+    )
+
+
+def test_sql_executes_and_includes_named_multiindex(
+    scalars_df_default_index, bigquery_client
+):
+    """Test that DataFrame.sql returns executable SQL.
+
+    DF.sql is used in public documentation such as
+    https://cloud.google.com/blog/products/data-analytics/using-bigquery-dataframes-with-carto-geospatial-tools
+    as a way to pass a DataFrame on to carto without executing the SQL
+    immediately.
+
+    Make sure that this SQL can be run outside of BigQuery DataFrames (assuming
+    similar credentials / access to the referenced tables).
+    """
+    # Do some operations to make for more complex SQL.
+    df = (
+        scalars_df_default_index.drop(columns=["geography_col"])
+        .groupby(["string_col", "bool_col"])
+        .max()
+    )
+    query = df.sql
+
+    bf_result = df.to_pandas().sort_values("rowindex")
+    bq_result = (
+        bigquery_client.query_and_wait(query)
+        .to_dataframe()
+        .set_index(["string_col", "bool_col"])
+        .sort_values("rowindex")
+    )
+    pandas.testing.assert_frame_equal(
+        bf_result, bq_result, check_dtype=False, check_index_type=False
+    )
+
+
+def test_to_arrow(scalars_df_default_index, scalars_pandas_df_default_index):
+    """Verify to_arrow() APIs returns the expected data."""
+    expected = pa.Table.from_pandas(
+        scalars_pandas_df_default_index.drop(columns=["geography_col"])
+    )
+
+    with pytest.warns(
+        bigframes.exceptions.PreviewWarning,
+        match="to_arrow",
+    ):
+        actual = scalars_df_default_index.drop(columns=["geography_col"]).to_arrow()
+
+    # Make string_col match type. Otherwise, pa.Table.from_pandas uses
+    # LargeStringArray. LargeStringArray is unnecessary because our strings are
+    # less than 2 GB.
+    expected = expected.set_column(
+        expected.column_names.index("string_col"),
+        pa.field("string_col", pa.string()),
+        expected["string_col"].cast(pa.string()),
+    )
+
+    # Note: the final .equals assertion covers all these checks, but these
+    # finer-grained assertions are easier to debug.
+    assert actual.column_names == expected.column_names
+    for column in actual.column_names:
+        assert actual[column].equals(expected[column])
+    assert actual.equals(expected)
+
+
+def test_to_arrow_multiindex(scalars_df_index, scalars_pandas_df_index):
+    scalars_df_multiindex = scalars_df_index.set_index(["string_col", "int64_col"])
+    scalars_pandas_df_multiindex = scalars_pandas_df_index.set_index(
+        ["string_col", "int64_col"]
+    )
+    expected = pa.Table.from_pandas(
+        scalars_pandas_df_multiindex.drop(columns=["geography_col"])
+    )
+
+    with pytest.warns(
+        bigframes.exceptions.PreviewWarning,
+        match="to_arrow",
+    ):
+        actual = scalars_df_multiindex.drop(columns=["geography_col"]).to_arrow()
+
+    # Make string_col match type. Otherwise, pa.Table.from_pandas uses
+    # LargeStringArray. LargeStringArray is unnecessary because our strings are
+    # less than 2 GB.
+    expected = expected.set_column(
+        expected.column_names.index("string_col"),
+        pa.field("string_col", pa.string()),
+        expected["string_col"].cast(pa.string()),
+    )
+
+    # Note: the final .equals assertion covers all these checks, but these
+    # finer-grained assertions are easier to debug.
+    assert actual.column_names == expected.column_names
+    for column in actual.column_names:
+        assert actual[column].equals(expected[column])
+    assert actual.equals(expected)
 
 
 def test_to_pandas_w_correct_dtypes(scalars_df_default_index):
@@ -100,7 +259,7 @@ def test_load_json(session):
         {
             "json_column": ['{"bar":true,"foo":10}'],
         },
-        dtype=pd.StringDtype(storage="pyarrow"),
+        dtype=pd.ArrowDtype(pa.large_string()),
     )
     expected.index = expected.index.astype("Int64")
     pd.testing.assert_series_equal(result.dtypes, expected.dtypes)
@@ -116,8 +275,8 @@ def test_to_pandas_batches_w_correct_dtypes(scalars_df_default_index):
 
 
 @pytest.mark.parametrize(
-    ("index"),
-    [True, False],
+    ("index",),
+    [(True,), (False,)],
 )
 def test_to_csv_index(
     scalars_dfs: Tuple[bigframes.dataframe.DataFrame, pd.DataFrame],
@@ -129,12 +288,9 @@ def test_to_csv_index(
     """Test the `to_csv` API with the `index` parameter."""
     scalars_df, scalars_pandas_df = scalars_dfs
     index_col = None
-    if scalars_df.index.name is not None:
-        path = gcs_folder + f"test_index_df_to_csv_index_{index}*.csv"
-        if index:
-            index_col = typing.cast(str, scalars_df.index.name)
-    else:
-        path = gcs_folder + f"test_default_index_df_to_csv_index_{index}*.csv"
+    path = gcs_folder + f"test_index_df_to_csv_index_{index}*.csv"
+    if index:
+        index_col = typing.cast(str, scalars_df.index.name)
 
     # TODO(swast): Support "date_format" parameter and make sure our
     # DATETIME/TIMESTAMP column export is the same format as pandas by default.
@@ -149,12 +305,12 @@ def test_to_csv_index(
     # read_csv will decode into bytes inproperly, convert_pandas_dtypes will encode properly from string
     dtype.pop("bytes_col")
     gcs_df = pd.read_csv(
-        path,
+        utils.get_first_file_from_wildcard(path),
         dtype=dtype,
         date_format={"timestamp_col": "YYYY-MM-DD HH:MM:SS Z"},
         index_col=index_col,
     )
-    convert_pandas_dtypes(gcs_df, bytes_col=True)
+    utils.convert_pandas_dtypes(gcs_df, bytes_col=True)
     gcs_df.index.name = scalars_df.index.name
 
     scalars_pandas_df = scalars_pandas_df.copy()
@@ -187,13 +343,13 @@ def test_to_csv_tabs(
     # read_csv will decode into bytes inproperly, convert_pandas_dtypes will encode properly from string
     dtype.pop("bytes_col")
     gcs_df = pd.read_csv(
-        path,
+        utils.get_first_file_from_wildcard(path),
         sep="\t",
         dtype=dtype,
         date_format={"timestamp_col": "YYYY-MM-DD HH:MM:SS Z"},
         index_col=index_col,
     )
-    convert_pandas_dtypes(gcs_df, bytes_col=True)
+    utils.convert_pandas_dtypes(gcs_df, bytes_col=True)
     gcs_df.index.name = scalars_df.index.name
 
     scalars_pandas_df = scalars_pandas_df.copy()
@@ -227,7 +383,7 @@ def test_to_gbq_index(scalars_dfs, dataset_id, index):
     else:
         df_out = df_out.sort_values("rowindex_2").reset_index(drop=True)
 
-    convert_pandas_dtypes(df_out, bytes_col=False)
+    utils.convert_pandas_dtypes(df_out, bytes_col=False)
     # pd.read_gbq interpets bytes_col as object, reconvert to pyarrow binary
     df_out["bytes_col"] = df_out["bytes_col"].astype(pd.ArrowDtype(pa.binary()))
     expected = scalars_pandas_df.copy()
@@ -386,11 +542,8 @@ def test_to_json_index_invalid_orient(
     gcs_folder: str,
     index: bool,
 ):
-    scalars_df, scalars_pandas_df = scalars_dfs
-    if scalars_df.index.name is not None:
-        path = gcs_folder + f"test_index_df_to_json_index_{index}*.jsonl"
-    else:
-        path = gcs_folder + f"test_default_index_df_to_json_index_{index}*.jsonl"
+    scalars_df, _ = scalars_dfs
+    path = gcs_folder + f"test_index_df_to_json_index_{index}*.jsonl"
     with pytest.raises(ValueError):
         scalars_df.to_json(path, index=index, lines=True)
 
@@ -404,11 +557,8 @@ def test_to_json_index_invalid_lines(
     gcs_folder: str,
     index: bool,
 ):
-    scalars_df, scalars_pandas_df = scalars_dfs
-    if scalars_df.index.name is not None:
-        path = gcs_folder + f"test_index_df_to_json_index_{index}.jsonl"
-    else:
-        path = gcs_folder + f"test_default_index_df_to_json_index_{index}.jsonl"
+    scalars_df, _ = scalars_dfs
+    path = gcs_folder + f"test_index_df_to_json_index_{index}.jsonl"
     with pytest.raises(NotImplementedError):
         scalars_df.to_json(path, index=index)
 
@@ -422,18 +572,21 @@ def test_to_json_index_records_orient(
     gcs_folder: str,
     index: bool,
 ):
-    """Test the `to_json` API with the `index` parameter."""
-    scalars_df, scalars_pandas_df = scalars_dfs
-    if scalars_df.index.name is not None:
-        path = gcs_folder + f"test_index_df_to_json_index_{index}*.jsonl"
-    else:
-        path = gcs_folder + f"test_default_index_df_to_json_index_{index}*.jsonl"
+    """Test the `to_json` API with the `index` parameter.
 
-    """ Test the `to_json` API with `orient` is `records` and `lines` is True"""
+    Uses the scalable options orient='records' and lines=True.
+    """
+    scalars_df, scalars_pandas_df = scalars_dfs
+    path = gcs_folder + f"test_index_df_to_json_index_{index}*.jsonl"
+
     scalars_df.to_json(path, index=index, orient="records", lines=True)
 
-    gcs_df = pd.read_json(path, lines=True, convert_dates=["datetime_col"])
-    convert_pandas_dtypes(gcs_df, bytes_col=True)
+    gcs_df = pd.read_json(
+        utils.get_first_file_from_wildcard(path),
+        lines=True,
+        convert_dates=["datetime_col"],
+    )
+    utils.convert_pandas_dtypes(gcs_df, bytes_col=True)
     if index and scalars_df.index.name is not None:
         gcs_df = gcs_df.set_index(scalars_df.index.name)
 
@@ -456,11 +609,7 @@ def test_to_parquet_index(scalars_dfs, gcs_folder, index):
     """Test the `to_parquet` API with the `index` parameter."""
     scalars_df, scalars_pandas_df = scalars_dfs
     scalars_pandas_df = scalars_pandas_df.copy()
-
-    if scalars_df.index.name is not None:
-        path = gcs_folder + f"test_index_df_to_parquet_{index}*.parquet"
-    else:
-        path = gcs_folder + f"test_default_index_df_to_parquet_{index}*.parquet"
+    path = gcs_folder + f"test_index_df_to_parquet_{index}*.parquet"
 
     # TODO(b/268693993): Type GEOGRAPHY is not currently supported for parquet.
     scalars_df = scalars_df.drop(columns="geography_col")
@@ -471,8 +620,8 @@ def test_to_parquet_index(scalars_dfs, gcs_folder, index):
     # table.
     scalars_df.to_parquet(path, index=index)
 
-    gcs_df = pd.read_parquet(path.replace("*", "000000000000"))
-    convert_pandas_dtypes(gcs_df, bytes_col=False)
+    gcs_df = pd.read_parquet(utils.get_first_file_from_wildcard(path))
+    utils.convert_pandas_dtypes(gcs_df, bytes_col=False)
     if index and scalars_df.index.name is not None:
         gcs_df = gcs_df.set_index(scalars_df.index.name)
 
@@ -504,7 +653,7 @@ def test_to_sql_query_unnamed_index_included(
     pd_df = scalars_pandas_df_default_index.reset_index(drop=True)
     roundtrip = session.read_gbq(sql, index_col=idx_ids)
     roundtrip.index.names = [None]
-    assert_pandas_df_equal(roundtrip.to_pandas(), pd_df, check_index_type=False)
+    utils.assert_pandas_df_equal(roundtrip.to_pandas(), pd_df, check_index_type=False)
 
 
 def test_to_sql_query_named_index_included(
@@ -521,7 +670,7 @@ def test_to_sql_query_named_index_included(
 
     pd_df = scalars_pandas_df_default_index.set_index("rowindex_2", drop=True)
     roundtrip = session.read_gbq(sql, index_col=idx_ids)
-    assert_pandas_df_equal(roundtrip.to_pandas(), pd_df)
+    utils.assert_pandas_df_equal(roundtrip.to_pandas(), pd_df)
 
 
 def test_to_sql_query_unnamed_index_excluded(
@@ -536,7 +685,7 @@ def test_to_sql_query_unnamed_index_excluded(
 
     pd_df = scalars_pandas_df_default_index.reset_index(drop=True)
     roundtrip = session.read_gbq(sql)
-    assert_pandas_df_equal(
+    utils.assert_pandas_df_equal(
         roundtrip.to_pandas(), pd_df, check_index_type=False, ignore_order=True
     )
 
@@ -555,6 +704,6 @@ def test_to_sql_query_named_index_excluded(
         "rowindex_2", drop=True
     ).reset_index(drop=True)
     roundtrip = session.read_gbq(sql)
-    assert_pandas_df_equal(
+    utils.assert_pandas_df_equal(
         roundtrip.to_pandas(), pd_df, check_index_type=False, ignore_order=True
     )

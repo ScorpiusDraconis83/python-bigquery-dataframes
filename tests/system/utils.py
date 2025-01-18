@@ -15,12 +15,47 @@
 import base64
 import decimal
 import functools
+from typing import Iterable, Optional, Set, Union
 
 import geopandas as gpd  # type: ignore
+import google.api_core.operation
+from google.cloud import bigquery, functions_v2
+from google.cloud.functions_v2.types import functions
 import numpy as np
 import pandas as pd
 import pyarrow as pa  # type: ignore
 import pytest
+
+import bigframes.functions._utils as functions_utils
+import bigframes.pandas
+
+ML_REGRESSION_METRICS = [
+    "mean_absolute_error",
+    "mean_squared_error",
+    "mean_squared_log_error",
+    "median_absolute_error",
+    "r2_score",
+    "explained_variance",
+]
+ML_CLASSFICATION_METRICS = [
+    "precision",
+    "recall",
+    "accuracy",
+    "f1_score",
+    "log_loss",
+    "roc_auc",
+]
+ML_GENERATE_TEXT_OUTPUT = [
+    "ml_generate_text_llm_result",
+    "ml_generate_text_status",
+    "prompt",
+]
+ML_GENERATE_EMBEDDING_OUTPUT = [
+    "ml_generate_embedding_result",
+    "ml_generate_embedding_statistics",
+    "ml_generate_embedding_status",
+    "content",
+]
 
 
 def skip_legacy_pandas(test):
@@ -31,6 +66,23 @@ def skip_legacy_pandas(test):
         return test(*args, **kwds)
 
     return wrapper
+
+
+# Prefer this function for tests that run in both ordered and unordered mode
+def assert_dfs_equivalent(
+    pd_df: pd.DataFrame, bf_df: bigframes.pandas.DataFrame, **kwargs
+):
+    bf_df_local = bf_df.to_pandas()
+    ignore_order = not bf_df._session._strictly_ordered
+    assert_pandas_df_equal(bf_df_local, pd_df, ignore_order=ignore_order, **kwargs)
+
+
+def assert_series_equivalent(
+    pd_series: pd.Series, bf_series: bigframes.pandas.Series, **kwargs
+):
+    bf_df_local = bf_series.to_pandas()
+    ignore_order = not bf_series._session._strictly_ordered
+    assert_series_equal(bf_df_local, pd_series, ignore_order=ignore_order, **kwargs)
 
 
 def assert_pandas_df_equal(df0, df1, ignore_order: bool = False, **kwargs):
@@ -241,3 +293,91 @@ def assert_pandas_df_equal_pca(actual, expected, **kwargs):
         except AssertionError:
             # Allow for sign difference per column
             pd.testing.assert_series_equal(-actual[column], expected[column], **kwargs)
+
+
+def check_pandas_df_schema_and_index(
+    pd_df: pd.DataFrame,
+    columns: Iterable,
+    index: Union[int, Iterable],
+    col_exact: bool = True,
+):
+    """Check pandas df schema and index. But not the values.
+
+    Args:
+        pd_df: the input pandas df
+        columns: target columns to check with
+        index: int or Iterable. If int, only check the length (index size) of the df. If Iterable, check index values match
+        col_exact: If True, check the columns param are exact match. Otherwise only check the df contains all of those columns
+    """
+    if col_exact:
+        assert list(pd_df.columns) == list(columns)
+    else:
+        assert set(columns) <= set(pd_df.columns)
+
+    if isinstance(index, int):
+        assert len(pd_df) == index
+    elif isinstance(index, Iterable):
+        assert list(pd_df.index) == list(index)
+    else:
+        raise ValueError("Unsupported index type.")
+
+
+def get_remote_function_endpoints(
+    bigquery_client: bigquery.Client, dataset_id: str
+) -> Set[str]:
+    """Get endpoints used by the remote functions in a datset"""
+    endpoints = set()
+    routines = bigquery_client.list_routines(dataset=dataset_id)
+    for routine in routines:
+        rf_options = routine._properties.get("remoteFunctionOptions")
+        if not rf_options:
+            continue
+        rf_endpoint = rf_options.get("endpoint")
+        if rf_endpoint:
+            endpoints.add(rf_endpoint)
+    return endpoints
+
+
+def get_cloud_functions(
+    functions_client: functions_v2.FunctionServiceClient,
+    project: str,
+    location: str,
+    name: Optional[str] = None,
+    name_prefix: Optional[str] = None,
+) -> Iterable[functions.ListFunctionsResponse]:
+    """Get the cloud functions in the given project and location."""
+
+    assert (
+        not name or not name_prefix
+    ), "Either 'name' or 'name_prefix' can be passed but not both."
+
+    _, location = functions_utils.get_remote_function_locations(location)
+    parent = f"projects/{project}/locations/{location}"
+    request = functions_v2.ListFunctionsRequest(parent=parent)
+    page_result = functions_client.list_functions(request=request)
+    for response in page_result:
+        # If name is provided and it does not match then skip
+        if bool(name):
+            full_name = parent + f"/functions/{name}"
+            if response.name != full_name:
+                continue
+        # If name prefix is provided and it does not match then skip
+        elif bool(name_prefix):
+            full_name_prefix = parent + f"/functions/{name_prefix}"
+            if not response.name.startswith(full_name_prefix):
+                continue
+
+        yield response
+
+
+def delete_cloud_function(
+    functions_client: functions_v2.FunctionServiceClient, full_name: str
+) -> google.api_core.operation.Operation:
+    """Delete a cloud function with the given fully qualified name."""
+    request = functions_v2.DeleteFunctionRequest(name=full_name)
+    operation = functions_client.delete_function(request=request)
+    return operation
+
+
+def get_first_file_from_wildcard(path):
+    return path.replace("*", "000000000000")

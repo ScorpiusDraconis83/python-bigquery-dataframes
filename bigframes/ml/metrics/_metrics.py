@@ -13,30 +13,31 @@
 # limitations under the License.
 
 """Metrics functions for evaluating models. This module is styled after
-Scikit-Learn's metrics module: https://scikit-learn.org/stable/modules/metrics.html."""
+scikit-learn's metrics module: https://scikit-learn.org/stable/modules/metrics.html."""
 
 import inspect
 import typing
 from typing import Tuple, Union
 
+import bigframes_vendored.constants as constants
+import bigframes_vendored.sklearn.metrics._classification as vendored_metrics_classification
+import bigframes_vendored.sklearn.metrics._ranking as vendored_metrics_ranking
+import bigframes_vendored.sklearn.metrics._regression as vendored_metrics_regression
 import numpy as np
 import pandas as pd
 import sklearn.metrics as sklearn_metrics  # type: ignore
 
-import bigframes.constants as constants
 from bigframes.ml import utils
 import bigframes.pandas as bpd
-import third_party.bigframes_vendored.sklearn.metrics._classification as vendored_mertics_classification
-import third_party.bigframes_vendored.sklearn.metrics._ranking as vendored_mertics_ranking
-import third_party.bigframes_vendored.sklearn.metrics._regression as vendored_metrics_regression
 
 
 def r2_score(
     y_true: Union[bpd.DataFrame, bpd.Series],
     y_pred: Union[bpd.DataFrame, bpd.Series],
+    *,
     force_finite=True,
 ) -> float:
-    y_true_series, y_pred_series = utils.convert_to_series(y_true, y_pred)
+    y_true_series, y_pred_series = utils.batch_convert_to_series(y_true, y_pred)
 
     # total sum of squares
     # (dataframe, scalar) binops
@@ -61,10 +62,11 @@ r2_score.__doc__ = inspect.getdoc(vendored_metrics_regression.r2_score)
 def accuracy_score(
     y_true: Union[bpd.DataFrame, bpd.Series],
     y_pred: Union[bpd.DataFrame, bpd.Series],
+    *,
     normalize=True,
 ) -> float:
     # TODO(ashleyxu): support sample_weight as the parameter
-    y_true_series, y_pred_series = utils.convert_to_series(y_true, y_pred)
+    y_true_series, y_pred_series = utils.batch_convert_to_series(y_true, y_pred)
 
     # Compute accuracy for each possible representation
     # TODO(ashleyxu): add multilabel classification support where y_type
@@ -77,12 +79,13 @@ def accuracy_score(
         return score.sum()
 
 
-accuracy_score.__doc__ = inspect.getdoc(vendored_mertics_classification.accuracy_score)
+accuracy_score.__doc__ = inspect.getdoc(vendored_metrics_classification.accuracy_score)
 
 
 def roc_curve(
     y_true: Union[bpd.DataFrame, bpd.Series],
     y_score: Union[bpd.DataFrame, bpd.Series],
+    *,
     drop_intermediate: bool = True,
 ) -> Tuple[bpd.Series, bpd.Series, bpd.Series]:
     # TODO(bmil): Add multi-class support
@@ -94,7 +97,7 @@ def roc_curve(
             f"drop_intermediate is not yet implemented. {constants.FEEDBACK_LINK}"
         )
 
-    y_true_series, y_score_series = utils.convert_to_series(y_true, y_score)
+    y_true_series, y_score_series = utils.batch_convert_to_series(y_true, y_score)
 
     session = y_true_series._block.expr.session
 
@@ -146,7 +149,7 @@ def roc_curve(
     )
 
 
-roc_curve.__doc__ = inspect.getdoc(vendored_mertics_ranking.roc_curve)
+roc_curve.__doc__ = inspect.getdoc(vendored_metrics_ranking.roc_curve)
 
 
 def roc_auc_score(
@@ -154,35 +157,31 @@ def roc_auc_score(
 ) -> float:
     # TODO(bmil): Add multi-class support
     # TODO(bmil): Add multi-label support
-    y_true_series, y_score_series = utils.convert_to_series(y_true, y_score)
+    y_true_series, y_score_series = utils.batch_convert_to_series(y_true, y_score)
 
     fpr, tpr, _ = roc_curve(y_true_series, y_score_series, drop_intermediate=False)
 
-    # TODO(bmil): remove this once bigframes supports the necessary operations
-    pd_fpr = fpr.to_pandas()
-    pd_tpr = tpr.to_pandas()
-
     # Use the trapezoid rule to compute the area under the ROC curve
-    width_diff = pd_fpr.diff().iloc[1:].reset_index(drop=True)
-    height_avg = (pd_tpr.iloc[:-1] + pd_tpr.iloc[1:].reset_index(drop=True)) / 2
-    return (width_diff * height_avg).sum()
+    width_diff = fpr.diff().iloc[1:].reset_index(drop=True)
+    height_avg = (tpr.iloc[:-1] + tpr.iloc[1:].reset_index(drop=True)) / 2
+    return typing.cast(float, (width_diff * height_avg).sum())
 
 
-roc_auc_score.__doc__ = inspect.getdoc(vendored_mertics_ranking.roc_auc_score)
+roc_auc_score.__doc__ = inspect.getdoc(vendored_metrics_ranking.roc_auc_score)
 
 
 def auc(
     x: Union[bpd.DataFrame, bpd.Series],
     y: Union[bpd.DataFrame, bpd.Series],
 ) -> float:
-    x_series, y_series = utils.convert_to_series(x, y)
+    x_series, y_series = utils.batch_convert_to_series(x, y)
 
     # TODO(b/286410053) Support ML exceptions and error handling.
     auc = sklearn_metrics.auc(x_series.to_pandas(), y_series.to_pandas())
     return auc
 
 
-auc.__doc__ = inspect.getdoc(vendored_mertics_ranking.auc)
+auc.__doc__ = inspect.getdoc(vendored_metrics_ranking.auc)
 
 
 def confusion_matrix(
@@ -190,7 +189,7 @@ def confusion_matrix(
     y_pred: Union[bpd.DataFrame, bpd.Series],
 ) -> pd.DataFrame:
     # TODO(ashleyxu): support labels and sample_weight parameters
-    y_true_series, y_pred_series = utils.convert_to_series(y_true, y_pred)
+    y_true_series, y_pred_series = utils.batch_convert_to_series(y_true, y_pred)
 
     y_true_series = y_true_series.rename("y_true")
     confusion_df = y_true_series.to_frame().assign(y_pred=y_pred_series)
@@ -220,14 +219,15 @@ def confusion_matrix(
 
 
 confusion_matrix.__doc__ = inspect.getdoc(
-    vendored_mertics_classification.confusion_matrix
+    vendored_metrics_classification.confusion_matrix
 )
 
 
 def recall_score(
     y_true: Union[bpd.DataFrame, bpd.Series],
     y_pred: Union[bpd.DataFrame, bpd.Series],
-    average: str = "binary",
+    *,
+    average: typing.Optional[str] = "binary",
 ) -> pd.Series:
     # TODO(ashleyxu): support more average type, default to "binary"
     if average is not None:
@@ -235,7 +235,7 @@ def recall_score(
             f"Only average=None is supported. {constants.FEEDBACK_LINK}"
         )
 
-    y_true_series, y_pred_series = utils.convert_to_series(y_true, y_pred)
+    y_true_series, y_pred_series = utils.batch_convert_to_series(y_true, y_pred)
 
     is_accurate = y_true_series == y_pred_series
     unique_labels = (
@@ -257,13 +257,14 @@ def recall_score(
     return recall_score
 
 
-recall_score.__doc__ = inspect.getdoc(vendored_mertics_classification.recall_score)
+recall_score.__doc__ = inspect.getdoc(vendored_metrics_classification.recall_score)
 
 
 def precision_score(
     y_true: Union[bpd.DataFrame, bpd.Series],
     y_pred: Union[bpd.DataFrame, bpd.Series],
-    average: str = "binary",
+    *,
+    average: typing.Optional[str] = "binary",
 ) -> pd.Series:
     # TODO(ashleyxu): support more average type, default to "binary"
     if average is not None:
@@ -271,7 +272,7 @@ def precision_score(
             f"Only average=None is supported. {constants.FEEDBACK_LINK}"
         )
 
-    y_true_series, y_pred_series = utils.convert_to_series(y_true, y_pred)
+    y_true_series, y_pred_series = utils.batch_convert_to_series(y_true, y_pred)
 
     is_accurate = y_true_series == y_pred_series
     unique_labels = (
@@ -294,17 +295,18 @@ def precision_score(
 
 
 precision_score.__doc__ = inspect.getdoc(
-    vendored_mertics_classification.precision_score
+    vendored_metrics_classification.precision_score
 )
 
 
 def f1_score(
     y_true: Union[bpd.DataFrame, bpd.Series],
     y_pred: Union[bpd.DataFrame, bpd.Series],
-    average: str = "binary",
+    *,
+    average: typing.Optional[str] = "binary",
 ) -> pd.Series:
     # TODO(ashleyxu): support more average type, default to "binary"
-    y_true_series, y_pred_series = utils.convert_to_series(y_true, y_pred)
+    y_true_series, y_pred_series = utils.batch_convert_to_series(y_true, y_pred)
 
     if average is not None:
         raise NotImplementedError(
@@ -328,4 +330,18 @@ def f1_score(
     return f1_score
 
 
-f1_score.__doc__ = inspect.getdoc(vendored_mertics_classification.f1_score)
+f1_score.__doc__ = inspect.getdoc(vendored_metrics_classification.f1_score)
+
+
+def mean_squared_error(
+    y_true: Union[bpd.DataFrame, bpd.Series],
+    y_pred: Union[bpd.DataFrame, bpd.Series],
+) -> float:
+    y_true_series, y_pred_series = utils.batch_convert_to_series(y_true, y_pred)
+
+    return (y_pred_series - y_true_series).pow(2).sum() / len(y_true_series)
+
+
+mean_squared_error.__doc__ = inspect.getdoc(
+    vendored_metrics_regression.mean_squared_error
+)

@@ -21,6 +21,7 @@ import pandas as pd
 import pytest
 
 import bigframes.core.global_session
+import bigframes.dataframe
 import bigframes.pandas as bpd
 import bigframes.session
 
@@ -34,6 +35,8 @@ def all_session_methods():
         if not attribute.startswith("_")
     )
     session_attributes.remove("close")
+    # streaming isn't in pandas
+    session_attributes.remove("read_gbq_table_streaming")
 
     for attribute in sorted(session_attributes):
         session_method = getattr(bigframes.session.Session, attribute)
@@ -49,7 +52,7 @@ def all_session_methods():
     [(method_name,) for method_name in all_session_methods()],
 )
 def test_method_matches_session(method_name: str):
-    if sys.version_info <= (3, 10):
+    if sys.version_info < (3, 10):
         pytest.skip(
             "Need Python 3.10 to reconcile deferred annotations."
         )  # pragma: no cover
@@ -67,7 +70,11 @@ def test_method_matches_session(method_name: str):
 
     # Add `eval_str = True` so that deferred annotations are turned into their
     # corresponding type objects. Need Python 3.10 for eval_str parameter.
-    session_signature = inspect.signature(session_method, eval_str=True)
+    session_signature = inspect.signature(
+        session_method,
+        eval_str=True,
+        globals={**vars(bigframes.session), **{"dataframe": bigframes.dataframe}},
+    )
     pandas_signature = inspect.signature(pandas_method, eval_str=True)
     assert [
         # Kind includes position, which will be an offset.

@@ -11,28 +11,29 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 import io
 import random
+import re
 import tempfile
 import textwrap
 import time
 import typing
-from typing import List
+from typing import List, Optional, Sequence
+import warnings
 
+import bigframes_vendored.pandas.io.gbq as vendored_pandas_gbq
+import google
 import google.cloud.bigquery as bigquery
 import numpy as np
 import pandas as pd
 import pytest
 
 import bigframes
-import bigframes.core.indexes.index
+import bigframes.core.indexes.base
 import bigframes.dataframe
 import bigframes.dtypes
 import bigframes.ml.linear_model
-from tests.system.utils import skip_legacy_pandas
-
-FIRST_FILE = "000000000000"
+from tests.system import utils
 
 
 def test_read_gbq_tokyo(
@@ -45,10 +46,10 @@ def test_read_gbq_tokyo(
     result = df.sort_index().to_pandas()
     expected = scalars_pandas_df_index
 
-    _, query_job = session_tokyo._execute(df._block.expr)
-    assert query_job.location == tokyo_location
+    result = session_tokyo._executor.execute(df._block.expr)
+    assert result.query_job.location == tokyo_location
 
-    pd.testing.assert_frame_equal(result, expected)
+    assert len(expected) == result.total_rows
 
 
 @pytest.mark.parametrize(
@@ -68,15 +69,6 @@ def test_read_gbq_tokyo(
             ["my_strings"],
             id="one_cols_in_query",
         ),
-        pytest.param(
-            "{scalars_table_id}",
-            ["unknown"],
-            marks=pytest.mark.xfail(
-                raises=ValueError,
-                reason="Column `unknown` not found in this table.",
-            ),
-            id="unknown_col",
-        ),
     ],
 )
 def test_read_gbq_w_columns(
@@ -89,6 +81,38 @@ def test_read_gbq_w_columns(
         query_or_table.format(scalars_table_id=scalars_table_id), columns=columns
     )
     assert df.columns.tolist() == columns
+
+
+def test_read_gbq_w_unknown_column(
+    session: bigframes.Session,
+    scalars_table_id: str,
+):
+    with pytest.raises(
+        ValueError,
+        match=re.escape(
+            "Column 'int63_col' of `columns` not found in this table. Did you mean 'int64_col'?"
+        ),
+    ):
+        session.read_gbq(
+            scalars_table_id,
+            columns=["string_col", "int63_col", "bool_col"],
+        )
+
+
+def test_read_gbq_w_unknown_index_col(
+    session: bigframes.Session,
+    scalars_table_id: str,
+):
+    with pytest.raises(
+        ValueError,
+        match=re.escape(
+            "Column 'int64_two' of `index_col` not found in this table. Did you mean 'int64_too'?"
+        ),
+    ):
+        session.read_gbq(
+            scalars_table_id,
+            index_col=["int64_col", "int64_two"],
+        )
 
 
 @pytest.mark.parametrize(
@@ -236,18 +260,20 @@ def test_read_gbq_w_anonymous_query_results_table(session: bigframes.Session):
 def test_read_gbq_w_primary_keys_table(
     session: bigframes.Session, usa_names_grouped_table: bigquery.Table
 ):
+    # Validate that the table we're querying has a primary key.
     table = usa_names_grouped_table
-    # TODO(b/305264153): Use public properties to fetch primary keys once
-    # added to google-cloud-bigquery.
-    primary_keys = (
-        table._properties.get("tableConstraints", {})
-        .get("primaryKey", {})
-        .get("columns")
-    )
+    table_constraints = table.table_constraints
+    assert table_constraints is not None
+    primary_key = table_constraints.primary_key
+    assert primary_key is not None
+    primary_keys = primary_key.columns
     assert len(primary_keys) != 0
 
     df = session.read_gbq(f"{table.project}.{table.dataset_id}.{table.table_id}")
     result = df.head(100).to_pandas()
+
+    # Verify that primary keys are used as the index.
+    assert list(result.index.names) == list(primary_keys)
 
     # Verify that the DataFrame is already sorted by primary keys.
     sorted_result = result.sort_values(primary_keys)
@@ -255,6 +281,42 @@ def test_read_gbq_w_primary_keys_table(
 
     # Verify that we're working from a snapshot rather than a copy of the table.
     assert "FOR SYSTEM_TIME AS OF TIMESTAMP" in df.sql
+
+
+def test_read_gbq_w_primary_keys_table_and_filters(
+    session: bigframes.Session, usa_names_grouped_table: bigquery.Table
+):
+    """
+    Verify fix for internal issue 338039517, where using filters didn't use the
+    primary keys for indexing / ordering.
+    """
+    # Validate that the table we're querying has a primary key.
+    table = usa_names_grouped_table
+    table_constraints = table.table_constraints
+    assert table_constraints is not None
+    primary_key = table_constraints.primary_key
+    assert primary_key is not None
+    primary_keys = primary_key.columns
+    assert len(primary_keys) != 0
+
+    df = session.read_gbq(
+        f"{table.project}.{table.dataset_id}.{table.table_id}",
+        filters=typing.cast(
+            vendored_pandas_gbq.FiltersType,
+            [
+                ("name", "LIKE", "W%"),
+                ("total_people", ">", 100),
+            ],
+        ),
+    )
+    result = df.to_pandas()
+
+    # Verify that primary keys are used as the index.
+    assert list(result.index.names) == list(primary_keys)
+
+    # Verify that the DataFrame is already sorted by primary keys.
+    sorted_result = result.sort_values(primary_keys)
+    pd.testing.assert_frame_equal(result, sorted_result)
 
 
 @pytest.mark.parametrize(
@@ -327,30 +389,212 @@ def test_read_gbq_twice_with_same_timestamp(session, penguins_table_id):
     assert df3 is not None
 
 
-def test_read_gbq_wildcard(session: bigframes.Session):
-    df = session.read_gbq("bigquery-public-data.noaa_gsod.gsod193*")
-    assert df.shape == (348485, 32)
+@pytest.mark.parametrize(
+    "source_table",
+    [
+        "bigframes-dev.thelook_ecommerce.orders",
+        "bigframes-dev.bigframes_tests_sys.base_table_mat_view",
+    ],
+)
+def test_read_gbq_on_linked_dataset_warns(session, source_table):
+    with warnings.catch_warnings(record=True) as warned:
+        session.read_gbq(source_table, use_cache=False)
+        assert len(warned) == 1
+        assert warned[0].category == bigframes.exceptions.TimeTravelDisabledWarning
 
 
-def test_read_gbq_wildcard_with_filter(session: bigframes.Session):
-    df = session.read_gbq(
-        "bigquery-public-data.noaa_gsod.gsod19*",
-        filters=[("_table_suffix", ">=", "30"), ("_table_suffix", "<=", "39")],  # type: ignore
+def test_read_gbq_w_ambigous_name(
+    session: bigframes.Session,
+):
+    # Ensure read_gbq works when table and column share a name
+    df = (
+        session.read_gbq("bigframes-dev.bigframes_tests_sys.ambiguous_name")
+        .sort_values("x", ascending=False)
+        .reset_index(drop=True)
+        .to_pandas()
     )
-    assert df.shape == (348485, 32)
+    pd_df = pd.DataFrame({"x": [2, 1], "ambiguous_name": [20, 10]})
+    pd.testing.assert_frame_equal(df, pd_df, check_dtype=False, check_index_type=False)
 
 
-def test_read_gbq_table_wildcard(session: bigframes.Session):
-    df = session.read_gbq_table("bigquery-public-data.noaa_gsod.gsod193*")
-    assert df.shape == (348485, 32)
-
-
-def test_read_gbq_table_wildcard_with_filter(session: bigframes.Session):
+def test_read_gbq_table_clustered_with_filter(session: bigframes.Session):
     df = session.read_gbq_table(
-        "bigquery-public-data.noaa_gsod.gsod19*",
-        filters=[("_table_suffix", ">=", "30"), ("_table_suffix", "<=", "39")],  # type: ignore
+        "bigquery-public-data.cloud_storage_geo_index.landsat_index",
+        filters=typing.cast(
+            vendored_pandas_gbq.FiltersType,
+            [[("sensor_id", "LIKE", "OLI%")], [("sensor_id", "LIKE", "%TIRS")]],
+        ),
+        columns=["sensor_id"],
     )
-    assert df.shape == (348485, 32)
+    sensors = df.groupby(["sensor_id"]).agg("count").to_pandas(ordered=False)
+    assert "OLI" in sensors.index
+    assert "TIRS" in sensors.index
+    assert "OLI_TIRS" in sensors.index
+
+
+_GSOD_ALL_TABLES = "bigquery-public-data.noaa_gsod.gsod*"
+_GSOD_1930S = "bigquery-public-data.noaa_gsod.gsod193*"
+
+
+@pytest.mark.parametrize(
+    "api_method",
+    # Test that both methods work as there's a risk that read_gbq /
+    # read_gbq_table makes for an infinite loop. Table reads can convert to
+    # queries and read_gbq reads from tables.
+    ["read_gbq", "read_gbq_table"],
+)
+@pytest.mark.parametrize(
+    ("filters", "table_id", "index_col", "columns", "max_results"),
+    [
+        pytest.param(
+            [("_table_suffix", ">=", "1930"), ("_table_suffix", "<=", "1939")],
+            _GSOD_ALL_TABLES,
+            ["stn", "wban", "year", "mo", "da"],
+            ["temp", "max", "min"],
+            100,
+            id="all",
+        ),
+        pytest.param(
+            (),  # filters
+            _GSOD_1930S,
+            (),  # index_col
+            ["temp", "max", "min"],
+            None,  # max_results
+            id="columns",
+        ),
+        pytest.param(
+            [("_table_suffix", ">=", "1930"), ("_table_suffix", "<=", "1939")],
+            _GSOD_ALL_TABLES,
+            (),  # index_col,
+            (),  # columns
+            None,  # max_results
+            id="filters",
+        ),
+        pytest.param(
+            (),  # filters
+            _GSOD_1930S,
+            ["stn", "wban", "year", "mo", "da"],
+            (),  # columns
+            None,  # max_results
+            id="index_col",
+        ),
+        pytest.param(
+            (),  # filters
+            _GSOD_1930S,
+            (),  # index_col
+            (),  # columns
+            100,  # max_results
+            id="max_results",
+        ),
+    ],
+)
+def test_read_gbq_wildcard(
+    session: bigframes.Session,
+    api_method: str,
+    filters,
+    table_id: str,
+    index_col: Sequence[str],
+    columns: Sequence[str],
+    max_results: Optional[int],
+):
+    table_metadata = session.bqclient.get_table(table_id)
+    method = getattr(session, api_method)
+    df = method(
+        table_id,
+        filters=filters,
+        index_col=index_col,
+        columns=columns,
+        max_results=max_results,
+    )
+    num_rows, num_columns = df.shape
+
+    if index_col:
+        assert list(df.index.names) == list(index_col)
+    else:
+        assert df.index.name is None
+
+    expected_columns = (
+        columns
+        if columns
+        else [
+            field.name
+            for field in table_metadata.schema
+            if field.name not in index_col and field.name not in columns
+        ]
+    )
+    assert list(df.columns) == expected_columns
+    assert num_rows > 0
+    assert num_columns == len(expected_columns)
+
+
+@pytest.mark.parametrize(
+    ("config"),
+    [
+        {
+            "query": {
+                "useQueryCache": True,
+                "maximumBytesBilled": "1000000000",
+                "timeoutMs": 10000,
+            }
+        },
+        pytest.param(
+            {"query": {"useQueryCache": True, "timeoutMs": 50}},
+            marks=pytest.mark.xfail(
+                raises=google.api_core.exceptions.BadRequest,
+                reason="Expected failure due to timeout being set too short.",
+            ),
+        ),
+        pytest.param(
+            {"query": {"useQueryCache": False, "maximumBytesBilled": "100"}},
+            marks=pytest.mark.xfail(
+                raises=google.api_core.exceptions.InternalServerError,
+                reason="Expected failure when the query exceeds the maximum bytes billed limit.",
+            ),
+        ),
+    ],
+)
+def test_read_gbq_with_configuration(
+    session: bigframes.Session, scalars_table_id: str, config: dict
+):
+    query = f"""SELECT
+                t.float64_col * 2 AS my_floats,
+                CONCAT(t.string_col, "_2") AS my_strings,
+                t.int64_col > 0 AS my_bools,
+            FROM `{scalars_table_id}` AS t
+            """
+
+    df = session.read_gbq(query, configuration=config)
+
+    assert df.shape == (9, 3)
+
+
+def test_read_gbq_with_custom_global_labels(
+    session: bigframes.Session, scalars_table_id: str
+):
+    # Ensure we use thread-local variables to avoid conflicts with parallel tests.
+    with bigframes.option_context("compute.extra_query_labels", {}):
+        bigframes.options.compute.assign_extra_query_labels(test1=1, test2="abc")
+        bigframes.options.compute.extra_query_labels["test3"] = False
+
+        query_job = session.read_gbq(scalars_table_id).query_job
+
+        # No real job created from read_gbq, so we should expect 0 labels
+        assert query_job is not None
+        assert query_job.labels == {}
+    # No labels outside of the option_context.
+    assert len(bigframes.options.compute.extra_query_labels) == 0
+
+
+def test_read_gbq_external_table(session: bigframes.Session):
+    # Verify the table is external to ensure it hasn't been altered
+    external_table_id = "bigframes-dev.bigframes_tests_sys.parquet_external_table"
+    external_table = session.bqclient.get_table(external_table_id)
+    assert external_table.table_type == "EXTERNAL"
+
+    df = session.read_gbq(external_table_id)
+
+    assert list(df.columns) == ["idx", "s1", "s2", "s3", "s4", "i1", "f1", "i2", "f2"]
+    assert df["i1"].max() == 99
 
 
 def test_read_gbq_model(session, penguins_linear_model_name):
@@ -367,6 +611,41 @@ def test_read_pandas(session, scalars_dfs):
     expected = scalars_pandas_df
 
     pd.testing.assert_frame_equal(result, expected)
+
+
+def test_read_pandas_series(session):
+
+    idx: pd.Index = pd.Index([2, 7, 1, 2, 8], dtype=pd.Int64Dtype())
+    pd_series = pd.Series([3, 1, 4, 1, 5], dtype=pd.Int64Dtype(), index=idx)
+    bf_series = session.read_pandas(pd_series)
+
+    pd.testing.assert_series_equal(bf_series.to_pandas(), pd_series)
+
+
+def test_read_pandas_index(session):
+
+    pd_idx: pd.Index = pd.Index([2, 7, 1, 2, 8], dtype=pd.Int64Dtype())
+    bf_idx = session.read_pandas(pd_idx)
+
+    pd.testing.assert_index_equal(bf_idx.to_pandas(), pd_idx)
+
+
+def test_read_pandas_w_unsupported_mixed_dtype(session):
+    with pytest.raises(ValueError, match="Could not convert"):
+        session.read_pandas(pd.DataFrame({"a": [1, "hello"]}))
+
+
+def test_read_pandas_inline_respects_location():
+    options = bigframes.BigQueryOptions(location="europe-west1")
+    session = bigframes.Session(options)
+
+    df = session.read_pandas(pd.DataFrame([[1, 2, 3], [4, 5, 6]]))
+    repr(df)
+
+    assert df.query_job is not None
+
+    table = session.bqclient.get_table(df.query_job.destination)
+    assert table.location == "europe-west1"
 
 
 def test_read_pandas_col_label_w_space(session: bigframes.Session):
@@ -406,20 +685,26 @@ def test_read_pandas_tokyo(
     result = df.to_pandas()
     expected = scalars_pandas_df_index
 
-    _, query_job = session_tokyo._execute(df._block.expr)
-    assert query_job.location == tokyo_location
+    result = session_tokyo._executor.execute(df._block.expr)
+    assert result.query_job.location == tokyo_location
 
-    pd.testing.assert_frame_equal(result, expected)
+    assert len(expected) == result.total_rows
 
 
-@skip_legacy_pandas
-def test_read_csv_gcs_default_engine(session, scalars_dfs, gcs_folder):
+@utils.skip_legacy_pandas
+@pytest.mark.parametrize(
+    ("write_engine",),
+    (
+        ("default",),
+        ("bigquery_inline",),
+        ("bigquery_load",),
+        ("bigquery_streaming",),
+    ),
+)
+def test_read_csv_gcs_default_engine(session, scalars_dfs, gcs_folder, write_engine):
     scalars_df, _ = scalars_dfs
-    if scalars_df.index.name is not None:
-        path = gcs_folder + "test_read_csv_gcs_default_engine_w_index*.csv"
-    else:
-        path = gcs_folder + "test_read_csv_gcs_default_engine_wo_index*.csv"
-    read_path = path.replace("*", FIRST_FILE)
+    path = gcs_folder + "test_read_csv_gcs_default_engine_w_index*.csv"
+    read_path = utils.get_first_file_from_wildcard(path)
     scalars_df.to_csv(path, index=False)
     dtype = scalars_df.dtypes.to_dict()
     dtype.pop("geography_col")
@@ -427,6 +712,7 @@ def test_read_csv_gcs_default_engine(session, scalars_dfs, gcs_folder):
         read_path,
         # Convert default pandas dtypes to match BigQuery DataFrames dtypes.
         dtype=dtype,
+        write_engine=write_engine,
     )
 
     # TODO(chelsealin): If we serialize the index, can more easily compare values.
@@ -442,12 +728,13 @@ def test_read_csv_gcs_default_engine(session, scalars_dfs, gcs_folder):
 
 def test_read_csv_gcs_bq_engine(session, scalars_dfs, gcs_folder):
     scalars_df, _ = scalars_dfs
-    if scalars_df.index.name is not None:
-        path = gcs_folder + "test_read_csv_gcs_bq_engine_w_index*.csv"
-    else:
-        path = gcs_folder + "test_read_csv_gcs_bq_engine_wo_index*.csv"
+    path = gcs_folder + "test_read_csv_gcs_bq_engine_w_index*.csv"
     scalars_df.to_csv(path, index=False)
-    df = session.read_csv(path, engine="bigquery")
+    df = session.read_csv(
+        path,
+        engine="bigquery",
+        index_col=bigframes.enums.DefaultIndexKind.SEQUENTIAL_INT64,
+    )
 
     # TODO(chelsealin): If we serialize the index, can more easily compare values.
     pd.testing.assert_index_equal(df.columns, scalars_df.columns)
@@ -469,7 +756,7 @@ def test_read_csv_gcs_bq_engine(session, scalars_dfs, gcs_folder):
         pytest.param("\t", id="custom_sep"),
     ],
 )
-@skip_legacy_pandas
+@utils.skip_legacy_pandas
 def test_read_csv_local_default_engine(session, scalars_dfs, sep):
     scalars_df, scalars_pandas_df = scalars_dfs
     with tempfile.TemporaryDirectory() as dir:
@@ -552,44 +839,24 @@ def test_read_csv_localbuffer_bq_engine(session, scalars_dfs):
         pd.testing.assert_series_equal(df.dtypes, scalars_df.dtypes)
 
 
-@pytest.mark.parametrize(
-    ("kwargs", "match"),
-    [
-        pytest.param(
-            {"engine": "bigquery", "names": []},
-            "BigQuery engine does not support these arguments",
-            id="with_names",
-        ),
-        pytest.param(
-            {"engine": "bigquery", "dtype": {}},
-            "BigQuery engine does not support these arguments",
-            id="with_dtype",
-        ),
-        pytest.param(
-            {"engine": "bigquery", "index_col": False},
-            "BigQuery engine only supports a single column name for `index_col`.",
-            id="with_index_col_false",
-        ),
-        pytest.param(
-            {"engine": "bigquery", "index_col": 5},
-            "BigQuery engine only supports a single column name for `index_col`.",
-            id="with_index_col_not_str",
-        ),
-        pytest.param(
-            {"engine": "bigquery", "usecols": [1, 2]},
-            "BigQuery engine only supports an iterable of strings for `usecols`.",
-            id="with_usecols_invalid",
-        ),
-        pytest.param(
-            {"engine": "bigquery", "encoding": "ASCII"},
-            "BigQuery engine only supports the following encodings",
-            id="with_encoding_invalid",
-        ),
-    ],
-)
-def test_read_csv_bq_engine_throws_not_implemented_error(session, kwargs, match):
-    with pytest.raises(NotImplementedError, match=match):
-        session.read_csv("", **kwargs)
+def test_read_csv_bq_engine_supports_index_col_false(
+    session, scalars_df_index, gcs_folder
+):
+    path = gcs_folder + "test_read_csv_bq_engine_supports_index_col_false*.csv"
+    read_path = utils.get_first_file_from_wildcard(path)
+    scalars_df_index.to_csv(path)
+
+    df = session.read_csv(
+        read_path,
+        # Normally, pandas uses the first column as the index. index_col=False
+        # turns off that behavior.
+        index_col=False,
+    )
+    assert df.shape[0] == scalars_df_index.shape[0]
+
+    # We use a default index because of index_col=False, so the previous index
+    # column is just loaded as a column.
+    assert len(df.columns) == len(scalars_df_index.columns) + 1
 
 
 @pytest.mark.parametrize(
@@ -618,7 +885,7 @@ def test_read_csv_default_engine_throws_not_implemented_error(
         gcs_folder
         + "test_read_csv_gcs_default_engine_throws_not_implemented_error*.csv"
     )
-    read_path = path.replace("*", FIRST_FILE)
+    read_path = utils.get_first_file_from_wildcard(path)
     scalars_df_index.to_csv(path)
     with pytest.raises(NotImplementedError, match=match):
         session.read_csv(read_path, **kwargs)
@@ -626,7 +893,7 @@ def test_read_csv_default_engine_throws_not_implemented_error(
 
 def test_read_csv_gcs_default_engine_w_header(session, scalars_df_index, gcs_folder):
     path = gcs_folder + "test_read_csv_gcs_default_engine_w_header*.csv"
-    read_path = path.replace("*", FIRST_FILE)
+    read_path = utils.get_first_file_from_wildcard(path)
     scalars_df_index.to_csv(path)
 
     # Skips header=N rows, normally considers the N+1th row as the header, but overridden by
@@ -693,7 +960,7 @@ def test_read_csv_gcs_default_engine_w_index_col_name(
     session, scalars_df_default_index, gcs_folder
 ):
     path = gcs_folder + "test_read_csv_gcs_default_engine_w_index_col_name*.csv"
-    read_path = path.replace("*", FIRST_FILE)
+    read_path = utils.get_first_file_from_wildcard(path)
     scalars_df_default_index.to_csv(path)
 
     df = session.read_csv(read_path, index_col="rowindex")
@@ -708,7 +975,7 @@ def test_read_csv_gcs_default_engine_w_index_col_index(
     session, scalars_df_default_index, gcs_folder
 ):
     path = gcs_folder + "test_read_csv_gcs_default_engine_w_index_col_index*.csv"
-    read_path = path.replace("*", FIRST_FILE)
+    read_path = utils.get_first_file_from_wildcard(path)
     scalars_df_default_index.to_csv(path)
 
     index_col = scalars_df_default_index.columns.to_list().index("rowindex")
@@ -767,7 +1034,7 @@ def test_read_csv_local_default_engine_w_index_col_index(
 def test_read_csv_gcs_w_usecols(session, scalars_df_index, gcs_folder, engine):
     path = gcs_folder + "test_read_csv_gcs_w_usecols"
     path = path + "_default_engine*.csv" if engine is None else path + "_bq_engine*.csv"
-    read_path = path.replace("*", FIRST_FILE) if engine is None else path
+    read_path = utils.get_first_file_from_wildcard(path) if engine is None else path
     scalars_df_index.to_csv(path)
 
     # df should only have 1 column which is bool_col.
@@ -791,6 +1058,25 @@ def test_read_csv_local_w_usecols(session, scalars_pandas_df_index, engine):
         # df should only have 1 column which is bool_col.
         df = session.read_csv(path, usecols=["bool_col"], engine=engine)
         assert len(df.columns) == 1
+
+
+@pytest.mark.parametrize(
+    "engine",
+    [
+        pytest.param(
+            "bigquery",
+            id="bq_engine",
+            marks=pytest.mark.xfail(
+                raises=NotImplementedError,
+            ),
+        ),
+        pytest.param(None, id="default_engine"),
+    ],
+)
+def test_read_csv_others(session, engine):
+    uri = "https://raw.githubusercontent.com/googleapis/python-bigquery-dataframes/main/tests/data/people.csv"
+    df = session.read_csv(uri, engine=engine)
+    assert len(df.columns) == 3
 
 
 @pytest.mark.parametrize(
@@ -856,21 +1142,58 @@ def test_read_pickle_gcs(session, penguins_pandas_df_default_index, gcs_folder):
     pd.testing.assert_frame_equal(penguins_pandas_df_default_index, df.to_pandas())
 
 
-def test_read_parquet_gcs(session: bigframes.Session, scalars_dfs, gcs_folder):
+@pytest.mark.parametrize(
+    ("engine", "filename"),
+    (
+        pytest.param(
+            "auto",
+            "000000000000.parquet",
+            id="auto",
+        ),
+        pytest.param(
+            "pyarrow",
+            "000000000000.parquet",
+            id="pyarrow",
+        ),
+        pytest.param(
+            "bigquery",
+            "000000000000.parquet",
+            id="bigquery",
+        ),
+        pytest.param(
+            "bigquery",
+            "*.parquet",
+            id="bigquery_wildcard",
+        ),
+        pytest.param(
+            "auto",
+            "*.parquet",
+            id="auto_wildcard",
+            marks=pytest.mark.xfail(
+                raises=ValueError,
+            ),
+        ),
+    ),
+)
+def test_read_parquet_gcs(
+    session: bigframes.Session, scalars_dfs, gcs_folder, engine, filename
+):
     scalars_df, _ = scalars_dfs
     # Include wildcard so that multiple files can be written/read if > 1 GB.
     # https://cloud.google.com/bigquery/docs/exporting-data#exporting_data_into_one_or_more_files
-    path = gcs_folder + test_read_parquet_gcs.__name__ + "*.parquet"
+    write_path = gcs_folder + test_read_parquet_gcs.__name__ + "*.parquet"
+    read_path = gcs_folder + test_read_parquet_gcs.__name__ + filename
+
     df_in: bigframes.dataframe.DataFrame = scalars_df.copy()
     # GEOGRAPHY not supported in parquet export.
     df_in = df_in.drop(columns="geography_col")
     # Make sure we can also serialize the order.
     df_write = df_in.reset_index(drop=False)
     df_write.index.name = f"ordering_id_{random.randrange(1_000_000)}"
-    df_write.to_parquet(path, index=True)
+    df_write.to_parquet(write_path, index=True)
 
     df_out = (
-        session.read_parquet(path)
+        session.read_parquet(read_path, engine=engine)
         # Restore order.
         .set_index(df_write.index.name).sort_index()
         # Restore index.
@@ -880,7 +1203,8 @@ def test_read_parquet_gcs(session: bigframes.Session, scalars_dfs, gcs_folder):
     # DATETIME gets loaded as TIMESTAMP in parquet. See:
     # https://cloud.google.com/bigquery/docs/exporting-data#parquet_export_details
     df_out = df_out.assign(
-        datetime_col=df_out["datetime_col"].astype("timestamp[us][pyarrow]")
+        datetime_col=df_out["datetime_col"].astype("timestamp[us][pyarrow]"),
+        timestamp_col=df_out["timestamp_col"].astype("timestamp[us, tz=UTC][pyarrow]"),
     )
 
     # Make sure we actually have at least some values before comparing.
@@ -919,7 +1243,7 @@ def test_read_parquet_gcs_compressed(
     df_write.to_parquet(path, compression=compression, index=True)
 
     df_out = (
-        session.read_parquet(path)
+        session.read_parquet(path, engine="bigquery")
         # Restore order.
         .set_index(df_write.index.name).sort_index()
         # Restore index.
@@ -976,7 +1300,7 @@ def test_read_parquet_gcs_compression_not_supported(
 def test_read_json_gcs_bq_engine(session, scalars_dfs, gcs_folder):
     scalars_df, _ = scalars_dfs
     path = gcs_folder + "test_read_json_gcs_bq_engine_w_index*.json"
-    read_path = path.replace("*", FIRST_FILE)
+    read_path = utils.get_first_file_from_wildcard(path)
     scalars_df.to_json(path, index=False, lines=True, orient="records")
     df = session.read_json(read_path, lines=True, orient="records", engine="bigquery")
 
@@ -1000,7 +1324,7 @@ def test_read_json_gcs_bq_engine(session, scalars_dfs, gcs_folder):
 def test_read_json_gcs_default_engine(session, scalars_dfs, gcs_folder):
     scalars_df, _ = scalars_dfs
     path = gcs_folder + "test_read_json_gcs_default_engine_w_index*.json"
-    read_path = path.replace("*", FIRST_FILE)
+    read_path = utils.get_first_file_from_wildcard(path)
     scalars_df.to_json(
         path,
         index=False,

@@ -16,24 +16,23 @@
 
 from __future__ import annotations
 
-from typing import Mapping
+from typing import Literal, Tuple
 
-import ibis
-import ibis.expr.datatypes as ibis_dtypes
-import ibis.expr.types as ibis_types
+import bigframes_vendored.ibis.expr.api as ibis_api
+import bigframes_vendored.ibis.expr.datatypes as ibis_dtypes
+import bigframes_vendored.ibis.expr.types as ibis_types
 
 import bigframes.core.compile.compiled as compiled
-import bigframes.core.compile.row_identity
-import bigframes.core.join_def as join_defs
-import bigframes.core.joins as joining
+import bigframes.core.guid as guids
+import bigframes.core.identifiers as ids
 import bigframes.core.ordering as orderings
 
 
 def join_by_column_ordered(
     left: compiled.OrderedIR,
     right: compiled.OrderedIR,
-    join: join_defs.JoinDefinition,
-    allow_row_identity_join: bool = True,
+    conditions: Tuple[Tuple[str, str], ...],
+    type: Literal["inner", "outer", "left", "right", "cross"],
 ) -> compiled.OrderedIR:
     """Join two expressions by column equality.
 
@@ -51,90 +50,90 @@ def join_by_column_ordered(
         first the coalesced join keys, then, all the left columns, and
         finally, all the right columns.
     """
-    if (
-        allow_row_identity_join
-        and join.type in bigframes.core.compile.row_identity.SUPPORTED_ROW_IDENTITY_HOW
-        and left._table.equals(right._table)
-        # Make sure we're joining on exactly the same column(s), at least with
-        # regards to value its possible that they both have the same names but
-        # were modified in different ways. Ignore differences in the names.
-        and all(
-            left._get_ibis_column(lcol)
-            .name("index")
-            .equals(right._get_ibis_column(rcol).name("index"))
-            for lcol, rcol in join.conditions
-        )
-    ):
-        return bigframes.core.compile.row_identity.join_by_row_identity_ordered(
-            left, right, join_def=join
-        )
+    if type == "right":
+        if left.order_non_deterministic:
+            right = right._bake_ordering()
     else:
-        l_hidden_mapping, r_hidden_mapping = joining.JoinNameRemapper(
-            namespace="hidden"
-        )(left._hidden_column_ids, right._hidden_column_ids)
-        l_mapping = {**join.get_left_mapping(), **l_hidden_mapping}
-        r_mapping = {**join.get_right_mapping(), **r_hidden_mapping}
+        if left.order_non_deterministic:
+            left = left._bake_ordering()
 
-        left_table = left._to_ibis_expr(
-            ordering_mode="unordered",
-            expose_hidden_cols=True,
-            col_id_overrides=l_mapping,
-        )
-        right_table = right._to_ibis_expr(
-            ordering_mode="unordered",
-            expose_hidden_cols=True,
-            col_id_overrides=r_mapping,
-        )
-        join_conditions = [
-            value_to_join_key(left_table[l_mapping[left_index]])
-            == value_to_join_key(right_table[r_mapping[right_index]])
-            for left_index, right_index in join.conditions
-        ]
+    # Do not reset the generator
+    l_value_mapping = dict(zip(left.column_ids, left.column_ids))
+    r_value_mapping = dict(zip(right.column_ids, right.column_ids))
 
-        combined_table = ibis.join(
-            left_table,
-            right_table,
-            predicates=join_conditions,
-            how=join.type,  # type: ignore
-        )
+    # hidden columns aren't necessarily unique, so need to remap to guids
+    l_hidden_mapping = {
+        id: guids.generate_guid("hidden_") for id in left._hidden_column_ids
+    }
+    r_hidden_mapping = {
+        id: guids.generate_guid("hidden_") for id in right._hidden_column_ids
+    }
 
-        # Preserve ordering accross joins.
-        ordering = join_orderings(
-            left._ordering,
-            right._ordering,
-            l_mapping,
-            r_mapping,
-            left_order_dominates=(join.type != "right"),
-        )
+    l_mapping = {**l_value_mapping, **l_hidden_mapping}
+    r_mapping = {**r_value_mapping, **r_hidden_mapping}
 
-        # We could filter out the original join columns, but predicates/ordering
-        # might still reference them in implicit joins.
-        columns = [
-            combined_table[l_mapping[col.get_name()]] for col in left.columns
-        ] + [combined_table[r_mapping[col.get_name()]] for col in right.columns]
-        hidden_ordering_columns = [
-            *[
-                combined_table[l_hidden_mapping[col.get_name()]]
-                for col in left._hidden_ordering_columns
-            ],
-            *[
-                combined_table[r_hidden_mapping[col.get_name()]]
-                for col in right._hidden_ordering_columns
-            ],
-        ]
-        return compiled.OrderedIR(
-            combined_table,
-            columns=columns,
-            hidden_ordering_columns=hidden_ordering_columns,
-            ordering=ordering,
-        )
+    left_table = left._to_ibis_expr(
+        ordering_mode="unordered",
+        expose_hidden_cols=True,
+    )
+    left_table = left_table.rename({val: key for key, val in l_hidden_mapping.items()})
+    right_table = right._to_ibis_expr(
+        ordering_mode="unordered",
+        expose_hidden_cols=True,
+    )
+    right_table = right_table.rename(
+        {val: key for key, val in r_hidden_mapping.items()}
+    )
+    join_conditions = [
+        value_to_join_key(left_table[l_mapping[left_index]])
+        == value_to_join_key(right_table[r_mapping[right_index]])
+        for left_index, right_index in conditions
+    ]
+
+    combined_table = ibis_api.join(
+        left_table,
+        right_table,
+        predicates=join_conditions,
+        how=type,  # type: ignore
+    )
+
+    # Preserve ordering accross joins.
+    ordering = orderings.join_orderings(
+        left._ordering,
+        right._ordering,
+        {ids.ColumnId(lin): ids.ColumnId(lout) for lin, lout in l_mapping.items()},
+        {ids.ColumnId(rin): ids.ColumnId(rout) for rin, rout in r_mapping.items()},
+        left_order_dominates=(type != "right"),
+    )
+
+    # We could filter out the original join columns, but predicates/ordering
+    # might still reference them in implicit joins.
+    columns = [combined_table[l_mapping[col.get_name()]] for col in left.columns] + [
+        combined_table[r_mapping[col.get_name()]] for col in right.columns
+    ]
+    hidden_ordering_columns = [
+        *[
+            combined_table[l_hidden_mapping[col.get_name()]]
+            for col in left._hidden_ordering_columns
+        ],
+        *[
+            combined_table[r_hidden_mapping[col.get_name()]]
+            for col in right._hidden_ordering_columns
+        ],
+    ]
+    return compiled.OrderedIR(
+        combined_table,
+        columns=columns,
+        hidden_ordering_columns=hidden_ordering_columns,
+        ordering=ordering,
+    )
 
 
 def join_by_column_unordered(
     left: compiled.UnorderedIR,
     right: compiled.UnorderedIR,
-    join: join_defs.JoinDefinition,
-    allow_row_identity_join: bool = True,
+    conditions: Tuple[Tuple[str, str], ...],
+    type: Literal["inner", "outer", "left", "right", "cross"],
 ) -> compiled.UnorderedIR:
     """Join two expressions by column equality.
 
@@ -152,90 +151,39 @@ def join_by_column_unordered(
         first the coalesced join keys, then, all the left columns, and
         finally, all the right columns.
     """
-    if (
-        allow_row_identity_join
-        and join.type in bigframes.core.compile.row_identity.SUPPORTED_ROW_IDENTITY_HOW
-        and left._table.equals(right._table)
-        # Make sure we're joining on exactly the same column(s), at least with
-        # regards to value its possible that they both have the same names but
-        # were modified in different ways. Ignore differences in the names.
-        and all(
-            left._get_ibis_column(lcol)
-            .name("index")
-            .equals(right._get_ibis_column(rcol).name("index"))
-            for lcol, rcol in join.conditions
-        )
-    ):
-        return bigframes.core.compile.row_identity.join_by_row_identity_unordered(
-            left, right, join_def=join
-        )
-    else:
-        # Value column mapping must use JOIN_NAME_REMAPPER to stay in sync with consumers of join result
-        l_mapping = join.get_left_mapping()
-        r_mapping = join.get_right_mapping()
-        left_table = left._to_ibis_expr(
-            col_id_overrides=l_mapping,
-        )
-        right_table = right._to_ibis_expr(
-            col_id_overrides=r_mapping,
-        )
-        join_conditions = [
-            value_to_join_key(left_table[l_mapping[left_index]])
-            == value_to_join_key(right_table[r_mapping[right_index]])
-            for left_index, right_index in join.conditions
-        ]
+    # Shouldn't need to select the column ids explicitly, but it seems that ibis has some
+    # bug resolving column ids otherwise, potentially because of the "JoinChain" op
+    left_table = left._to_ibis_expr().select(left.column_ids)
+    right_table = right._to_ibis_expr().select(right.column_ids)
+    join_conditions = [
+        value_to_join_key(left_table[left_index])
+        == value_to_join_key(right_table[right_index])
+        for left_index, right_index in conditions
+    ]
 
-        combined_table = ibis.join(
-            left_table,
-            right_table,
-            predicates=join_conditions,
-            how=join.type,  # type: ignore
-        )
-        # We could filter out the original join columns, but predicates/ordering
-        # might still reference them in implicit joins.
-        columns = [
-            combined_table[l_mapping[col.get_name()]] for col in left.columns
-        ] + [combined_table[r_mapping[col.get_name()]] for col in right.columns]
-        return compiled.UnorderedIR(
-            combined_table,
-            columns=columns,
-        )
+    combined_table = ibis_api.join(
+        left_table,
+        right_table,
+        predicates=join_conditions,
+        how=type,  # type: ignore
+    )
+    # We could filter out the original join columns, but predicates/ordering
+    # might still reference them in implicit joins.
+    columns = [combined_table[col.get_name()] for col in left.columns] + [
+        combined_table[col.get_name()] for col in right.columns
+    ]
+    return compiled.UnorderedIR(
+        combined_table,
+        columns=columns,
+    )
 
 
 def value_to_join_key(value: ibis_types.Value):
     """Converts nullable values to non-null string SQL will not match null keys together - but pandas does."""
     if not value.type().is_string():
         value = value.cast(ibis_dtypes.str)
-    return value.fillna(ibis_types.literal("$NULL_SENTINEL$"))
-
-
-def join_orderings(
-    left: orderings.ExpressionOrdering,
-    right: orderings.ExpressionOrdering,
-    left_id_mapping: Mapping[str, str],
-    right_id_mapping: Mapping[str, str],
-    left_order_dominates: bool = True,
-) -> orderings.ExpressionOrdering:
-    left_ordering_refs = [
-        ref.with_name(left_id_mapping[ref.column_id])
-        for ref in left.all_ordering_columns
-    ]
-    right_ordering_refs = [
-        ref.with_name(right_id_mapping[ref.column_id])
-        for ref in right.all_ordering_columns
-    ]
-    if left_order_dominates:
-        joined_refs = [*left_ordering_refs, *right_ordering_refs]
-    else:
-        joined_refs = [*right_ordering_refs, *left_ordering_refs]
-
-    left_total_order_cols = frozenset(
-        [left_id_mapping[id] for id in left.total_ordering_columns]
-    )
-    right_total_order_cols = frozenset(
-        [right_id_mapping[id] for id in right.total_ordering_columns]
-    )
-    return orderings.ExpressionOrdering(
-        ordering_value_columns=tuple(joined_refs),
-        total_ordering_columns=left_total_order_cols | right_total_order_cols,
+    return (
+        value.fill_null(ibis_types.literal("$NULL_SENTINEL$"))
+        if hasattr(value, "fill_null")
+        else value.fillna(ibis_types.literal("$NULL_SENTINEL$"))
     )
